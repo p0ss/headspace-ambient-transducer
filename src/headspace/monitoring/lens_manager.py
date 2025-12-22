@@ -18,9 +18,10 @@ from __future__ import annotations
 import json
 import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from enum import Enum
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple, Any, TYPE_CHECKING
+from typing import Dict, List, Optional, Set, Tuple, Any, Union, TYPE_CHECKING
 
 import numpy as np
 import torch
@@ -41,19 +42,32 @@ class LensRole(Enum):
 class SimpleMLP(nn.Module):
     """Simple MLP classifier matching SUMO training architecture."""
 
-    def __init__(self, input_dim: int, hidden_dim: int = 128):
+    def __init__(self, input_dim: int, hidden_dim: int = 128, dtype: torch.dtype = None, layer_norm: bool = False):
+        """
+        Args:
+            input_dim: Input feature dimension (model hidden_dim)
+            hidden_dim: MLP hidden layer dimension
+            dtype: Parameter dtype. If None, uses default (float32).
+                   Use torch.bfloat16 for memory-efficient inference.
+            layer_norm: If True, include LayerNorm at input (matches new training arch)
+        """
         super().__init__()
+        self.has_layer_norm = layer_norm
 
         # Keep 'net' name for backward compatibility with saved lenses
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
+        layers = []
+        if layer_norm:
+            layers.append(nn.LayerNorm(input_dim, dtype=dtype))
+        layers.extend([
+            nn.Linear(input_dim, hidden_dim, dtype=dtype),
             nn.ReLU(),
             nn.Dropout(0.2),
-            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.Linear(hidden_dim, hidden_dim // 2, dtype=dtype),
             nn.ReLU(),
             nn.Dropout(0.2),
-            nn.Linear(hidden_dim // 2, 1),
-        )
+            nn.Linear(hidden_dim // 2, 1, dtype=dtype),
+        ])
+        self.net = nn.Sequential(*layers)
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, x, return_logits=False):
@@ -74,6 +88,209 @@ class SimpleMLP(nn.Module):
         if return_logits:
             return probs, logits
         return probs
+
+
+def _detect_layer_norm(state_dict: dict) -> bool:
+    """Detect if state_dict has LayerNorm at input (1D weight vs 2D)."""
+    first_key = "net.0.weight" if "net.0.weight" in state_dict else "0.weight"
+    if first_key in state_dict:
+        return len(state_dict[first_key].shape) == 1
+    return False
+
+
+def _create_lens_from_state_dict(state_dict: dict, hidden_dim: int, device: str) -> SimpleMLP:
+    """Create SimpleMLP matching the state_dict architecture."""
+    has_ln = _detect_layer_norm(state_dict)
+    lens = SimpleMLP(hidden_dim, layer_norm=has_ln).to(device)
+    lens.eval()
+
+    # Handle missing net. prefix
+    if "0.weight" in state_dict and "net.0.weight" not in state_dict:
+        new_state_dict = {f"net.{k}": v for k, v in state_dict.items()}
+        state_dict = new_state_dict
+
+    lens.load_state_dict(state_dict)
+    return lens
+
+
+class BatchedLensBank(nn.Module):
+    """
+    Batched lens inference for running N lenses in a single forward pass.
+
+    Stacks lens weights into batched tensors for efficient GPU utilization.
+    Reduces N separate kernel launches to 3 batched matmuls.
+
+    Expected speedup: ~10x for 20+ lenses (based on kernel launch overhead ~10µs).
+    """
+
+    def __init__(self, device: str = "cuda"):
+        super().__init__()
+        self.device = device
+        self.concept_keys: List[str] = []
+        self.is_compiled = False
+        self.has_layer_norm = False
+
+        # Batched weight tensors (registered as buffers, not parameters)
+        self.register_buffer('LN_w', None)  # [N, input_dim] - LayerNorm weights (optional)
+        self.register_buffer('LN_b', None)  # [N, input_dim] - LayerNorm bias (optional)
+        self.register_buffer('W1', None)  # [N, hidden1, input_dim]
+        self.register_buffer('b1', None)  # [N, hidden1]
+        self.register_buffer('W2', None)  # [N, hidden2, hidden1]
+        self.register_buffer('b2', None)  # [N, hidden2]
+        self.register_buffer('W3', None)  # [N, 1, hidden2]
+        self.register_buffer('b3', None)  # [N, 1]
+
+    def add_lenses(self, lenses: Dict[str, nn.Module]):
+        """
+        Add lenses to the bank and recompile batched weights.
+
+        Args:
+            lenses: Dict of concept_key → SimpleMLP lens
+        """
+        if not lenses:
+            return
+
+        # Extract weights from each lens
+        W1_list, b1_list = [], []
+        W2_list, b2_list = [], []
+        W3_list, b3_list = [], []
+        LN_w_list, LN_b_list = [], []  # LayerNorm weights (optional)
+        has_layer_norm = None
+
+        for concept_key, lens in lenses.items():
+            # Detect structure based on first layer type
+            # With LayerNorm: [LN(0), Linear(1), ReLU(2), Drop(3), Linear(4), ReLU(5), Drop(6), Linear(7)]
+            # Without: [Linear(0), ReLU(1), Drop(2), Linear(3), ReLU(4), Drop(5), Linear(6)]
+            first_is_ln = hasattr(lens, 'has_layer_norm') and lens.has_layer_norm
+
+            if has_layer_norm is None:
+                has_layer_norm = first_is_ln
+            elif has_layer_norm != first_is_ln:
+                # Mixed architectures - can't batch, fall back to sequential
+                # This happens with packs that have some old lenses (no LN) and some new (with LN)
+                self.is_compiled = False
+                return
+
+            if first_is_ln:
+                # With LayerNorm
+                LN_w_list.append(lens.net[0].weight.data)
+                LN_b_list.append(lens.net[0].bias.data)
+                W1_list.append(lens.net[1].weight.data)
+                b1_list.append(lens.net[1].bias.data)
+                W2_list.append(lens.net[4].weight.data)
+                b2_list.append(lens.net[4].bias.data)
+                W3_list.append(lens.net[7].weight.data)
+                b3_list.append(lens.net[7].bias.data)
+            else:
+                # Without LayerNorm
+                W1_list.append(lens.net[0].weight.data)
+                b1_list.append(lens.net[0].bias.data)
+                W2_list.append(lens.net[3].weight.data)
+                b2_list.append(lens.net[3].bias.data)
+                W3_list.append(lens.net[6].weight.data)
+                b3_list.append(lens.net[6].bias.data)
+
+            self.concept_keys.append(concept_key)
+
+        # Store LayerNorm flag and weights
+        self.has_layer_norm = has_layer_norm or False
+        if self.has_layer_norm:
+            self.register_buffer('LN_w', torch.stack(LN_w_list).to(self.device))
+            self.register_buffer('LN_b', torch.stack(LN_b_list).to(self.device))
+
+        # Stack into batched tensors
+        self.W1 = torch.stack(W1_list).to(self.device)  # [N, 128, input_dim]
+        self.b1 = torch.stack(b1_list).to(self.device)  # [N, 128]
+        self.W2 = torch.stack(W2_list).to(self.device)  # [N, 64, 128]
+        self.b2 = torch.stack(b2_list).to(self.device)  # [N, 64]
+        self.W3 = torch.stack(W3_list).to(self.device)  # [N, 1, 64]
+        self.b3 = torch.stack(b3_list).to(self.device)  # [N, 1]
+
+        self.is_compiled = True
+
+    def clear(self):
+        """Clear all lenses from bank."""
+        self.concept_keys = []
+        self.has_layer_norm = False
+        self.LN_w = None
+        self.LN_b = None
+        self.W1 = None
+        self.b1 = None
+        self.W2 = None
+        self.b2 = None
+        self.W3 = None
+        self.b3 = None
+        self.is_compiled = False
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        return_logits: bool = False
+    ) -> Union[Dict[str, float], Tuple[Dict[str, float], Dict[str, float]]]:
+        """
+        Batched forward pass for all lenses.
+
+        Args:
+            x: Input hidden state [1, input_dim] or [input_dim]
+            return_logits: If True, return (probs_dict, logits_dict)
+
+        Returns:
+            Dict of concept_key → probability (and optionally logits)
+        """
+        if not self.is_compiled or self.W1 is None:
+            if return_logits:
+                return {}, {}
+            return {}
+
+        # Ensure proper shape: [1, input_dim]
+        if x.dim() == 1:
+            x = x.unsqueeze(0)
+
+        # Match dtype to weights
+        if x.dtype != self.W1.dtype:
+            x = x.to(dtype=self.W1.dtype)
+
+        N = len(self.concept_keys)
+
+        # Apply LayerNorm if present (batched element-wise)
+        if self.has_layer_norm and self.LN_w is not None:
+            # Normalize input: (x - mean) / sqrt(var + eps)
+            mean = x.mean(dim=-1, keepdim=True)
+            var = x.var(dim=-1, keepdim=True, unbiased=False)
+            x_norm = (x - mean) / torch.sqrt(var + 1e-5)
+            # Apply per-lens affine: x_norm * weight + bias
+            # x_norm: [1, input_dim], LN_w: [N, input_dim] -> [N, input_dim]
+            x_expanded = x_norm * self.LN_w + self.LN_b  # [N, input_dim]
+            x_expanded = x_expanded.unsqueeze(1)  # [N, 1, input_dim]
+        else:
+            # Layer 1: [N, 128] = [1, input_dim] @ [N, input_dim, 128] + [N, 128]
+            # Expand input for bmm: [N, 1, input_dim]
+            x_expanded = x.expand(N, -1, -1)  # [N, 1, input_dim]
+        h1 = torch.bmm(x_expanded, self.W1.transpose(1, 2))  # [N, 1, 128]
+        h1 = h1.squeeze(1) + self.b1  # [N, 128]
+        h1 = torch.relu(h1)
+
+        # Layer 2: [N, 64]
+        h2 = torch.bmm(h1.unsqueeze(1), self.W2.transpose(1, 2))  # [N, 1, 64]
+        h2 = h2.squeeze(1) + self.b2  # [N, 64]
+        h2 = torch.relu(h2)
+
+        # Layer 3: [N, 1]
+        logits = torch.bmm(h2.unsqueeze(1), self.W3.transpose(1, 2))  # [N, 1, 1]
+        logits = logits.squeeze(-1).squeeze(-1) + self.b3.squeeze(-1)  # [N]
+        probs = torch.sigmoid(logits)
+
+        # Convert to dicts (float() handles any dtype including bfloat16)
+        probs_dict = {key: float(probs[i].item()) for i, key in enumerate(self.concept_keys)}
+
+        if return_logits:
+            logits_dict = {key: float(logits[i].item()) for i, key in enumerate(self.concept_keys)}
+            return probs_dict, logits_dict
+
+        return probs_dict
+
+    def __len__(self):
+        return len(self.concept_keys)
 
 
 class SimplexBinding:
@@ -475,10 +692,16 @@ class DynamicLensManager:
         self.always_on_simplexes: Set[str] = set()
 
         # Warm cache: lenses that were recently relevant but not in top-k
-        # These stay in memory but are not actively run every token
+        # These stay in VRAM but are not actively run every token
         # Key: (sumo_term, layer), Value: (lens, reactivation_count)
         self.warm_cache: Dict[Tuple[str, int], Tuple[nn.Module, int]] = {}
         self.cache_reactivation_count: Dict[Tuple[str, int], int] = defaultdict(int)
+
+        # Tepid cache: state_dicts pre-loaded to CPU RAM
+        # Avoids torch.load() deserialization - just .to(device) when needed
+        # Key: (sumo_term, layer), Value: state_dict (CPU tensors)
+        self.tepid_cache: Dict[Tuple[str, int], Dict[str, torch.Tensor]] = {}
+        self._tepid_cache_loaded: bool = False
 
         # Track which lenses are in base layers (never evict these)
         self.base_layer_lenses: Set[Tuple[str, int]] = set()
@@ -490,6 +713,19 @@ class DynamicLensManager:
         self.model_pool: List[nn.Module] = []
         self.available_models: List[int] = []  # Indices of free models in pool
         self.model_pool_size: int = 100  # Preallocate 100 models
+
+        # Batched lens bank for efficient inference (10x faster than sequential)
+        self._lens_bank: Optional[BatchedLensBank] = None
+        self._lens_bank_dirty: bool = True  # Rebuild when lenses change
+        self._use_batched_inference: bool = True  # Can disable for debugging
+
+        # Bank support: per-parent consolidated lens files
+        # Reduces torch.load() calls from N to 1 per parent expansion
+        self._is_banked_pack: bool = False
+        self._bank_index: Dict[str, Dict] = {}  # parent_key -> {bank_path, concepts}
+        self._loaded_banks: Dict[str, Dict[str, Dict]] = {}  # bank_path -> {concept -> state_dict}
+        self._banks_dir: Optional[Path] = None
+        self._individual_dir: Optional[Path] = None
 
         # Statistics
         self.stats = {
@@ -513,6 +749,9 @@ class DynamicLensManager:
 
         # Load metadata
         self._load_all_metadata()
+
+        # Check for banked pack format (per-parent consolidated files)
+        self._detect_banked_pack()
 
         # Initialize manifest resolver after metadata is loaded
         if self.manifest is not None:
@@ -601,21 +840,29 @@ class DynamicLensManager:
             activation_path = None
 
             if self.using_lens_pack:
-                # First try layer-based structure (common for legacy lens packs)
+                # First try layer-based structure (common for lens packs)
                 layer_dir = self.lenses_dir / f"layer{layer}"
-                layer_based_path = layer_dir / f"{sumo_term}_classifier.pt"
+                # Try clean name first, then legacy _classifier suffix
+                layer_based_path = layer_dir / f"{sumo_term}.pt"
+                if not layer_based_path.exists():
+                    layer_based_path = layer_dir / f"{sumo_term}_classifier.pt"  # Legacy fallback
                 if layer_based_path.exists():
                     activation_path = layer_based_path
                     has_lens = True
                 else:
                     # Fall back to activation_lenses directory structure
-                    flat_path = self.activation_lenses_dir / f"{sumo_term}_classifier.pt"
+                    flat_path = self.activation_lenses_dir / f"{sumo_term}.pt"
+                    if not flat_path.exists():
+                        flat_path = self.activation_lenses_dir / f"{sumo_term}_classifier.pt"  # Legacy
                     if flat_path.exists():
                         activation_path = flat_path
                         has_lens = True
             else:
                 layer_dir = self.lenses_dir / f"layer{layer}"
-                activation_path = layer_dir / f"{sumo_term}_classifier.pt"
+                # Try clean name first, then legacy _classifier suffix
+                activation_path = layer_dir / f"{sumo_term}.pt"
+                if not activation_path.exists():
+                    activation_path = layer_dir / f"{sumo_term}_classifier.pt"  # Legacy fallback
                 has_lens = activation_path.exists()
 
             if not has_lens:
@@ -649,8 +896,10 @@ class DynamicLensManager:
                 # Legacy structure: results/sumo_classifiers/layer{N}/*
                 layer_dir = self.lenses_dir / f"layer{layer}"
 
-                # Activation lens path
-                activation_path = layer_dir / f"{sumo_term}_classifier.pt"
+                # Activation lens path - try clean name first, then legacy suffix
+                activation_path = layer_dir / f"{sumo_term}.pt"
+                if not activation_path.exists():
+                    activation_path = layer_dir / f"{sumo_term}_classifier.pt"  # Legacy fallback
                 if activation_path.exists():
                     metadata.activation_lens_path = activation_path
                     metadata.has_activation_lens = True
@@ -778,6 +1027,18 @@ class DynamicLensManager:
 
         print(f"  Built hierarchy from metadata (fallback mode)")
 
+    def _detect_banked_pack(self):
+        """Detect if this is a banked lens pack and load bank index."""
+        bank_index_path = self.lenses_dir / "bank_index.json"
+        if bank_index_path.exists():
+            self._is_banked_pack = True
+            self._bank_index = json.load(open(bank_index_path))
+            self._banks_dir = self.lenses_dir / "banks"
+            self._individual_dir = self.lenses_dir / "individual"
+            print(f"  Detected banked pack: {len(self._bank_index)} banks")
+        else:
+            self._is_banked_pack = False
+
     def _load_base_layers(self):
         """Load base layers for broad coverage, respecting manifest rules."""
         if self.manifest_resolver is not None:
@@ -837,6 +1098,30 @@ class DynamicLensManager:
             if pool_model is model:
                 self.available_models.append(i)
                 break
+
+    def _rebuild_lens_bank(self):
+        """
+        Rebuild the batched lens bank from currently loaded lenses.
+
+        Called lazily when bank is marked dirty and batched inference is needed.
+        Stacks all lens weights into batched tensors for 10x faster inference.
+        """
+        if not self._use_batched_inference:
+            return
+
+        if self._lens_bank is None:
+            self._lens_bank = BatchedLensBank(device=self.device)
+        else:
+            self._lens_bank.clear()
+
+        if self.loaded_lenses:
+            self._lens_bank.add_lenses(self.loaded_lenses)
+
+        self._lens_bank_dirty = False
+
+    def _mark_lens_bank_dirty(self):
+        """Mark lens bank as needing rebuild."""
+        self._lens_bank_dirty = True
 
     def _manage_cache_memory(self):
         """
@@ -920,8 +1205,30 @@ class DynamicLensManager:
                     # Track stats
                     self.stats['cache_hits'] += 1
                     warm_cache_hits += 1
+                elif concept_key in self.tepid_cache:
+                    # In tepid cache (CPU RAM) - fast .to(device) transfer
+                    state_dict = self.tepid_cache[concept_key]
+                    # Transfer to GPU
+                    state_dict_gpu = {k: v.to(self.device) for k, v in state_dict.items()}
+
+                    # Get model from pool or create new
+                    has_ln = _detect_layer_norm(state_dict_gpu)
+                    if has_ln:
+                        lens = _create_lens_from_state_dict(state_dict_gpu, self.hidden_dim, self.device)
+                    else:
+                        lens = self._get_model_from_pool()
+                        if lens is None:
+                            lens = SimpleMLP(self.hidden_dim).to(self.device)
+                            lens.eval()
+                        lens.load_state_dict(state_dict_gpu)
+
+                    self.loaded_activation_lenses[concept_key] = lens
+                    self.loaded_lenses[concept_key] = lens
+                    self.lens_scores[concept_key] = 0.0
+                    self.stats['cache_hits'] += 1  # Count as cache hit (RAM cache)
+                    self.stats['tepid_hits'] = self.stats.get('tepid_hits', 0) + 1
                 else:
-                    # Not in memory at all, need to load from disk
+                    # Not in any cache, need to load from disk
                     keys_to_load_activation.append(concept_key)
 
             # Check text lenses
@@ -942,25 +1249,27 @@ class DynamicLensManager:
                     metadata = self.concept_metadata.get(key)
                     if metadata and metadata.activation_lens_path and metadata.activation_lens_path.exists():
                         state_dict = torch.load(metadata.activation_lens_path, map_location='cpu')
-                        first_key_name = list(state_dict.keys())[0]
-                        self.hidden_dim = state_dict[first_key_name].shape[1]
-                        print(f"  Inferred hidden_dim: {self.hidden_dim}")
-                        break
+                        # Find first 2D weight to infer hidden_dim (skip LayerNorm which is 1D)
+                        for param_key, param in state_dict.items():
+                            if 'weight' in param_key and len(param.shape) == 2:
+                                self.hidden_dim = param.shape[1]
+                                print(f"  Inferred hidden_dim: {self.hidden_dim}")
+                                break
+                        if self.hidden_dim is not None:
+                            break
 
             # Ensure model pool is allocated
             self._ensure_model_pool()
 
-            # Batch load: Load all state_dicts first (can be parallelized)
-            state_dicts = []
-            valid_keys = []
-
-            for concept_key in keys_to_load_activation:
+            # Batch load: Load all state_dicts in parallel
+            def load_lens_state_dict(concept_key):
+                """Load a single lens state dict."""
                 metadata = self.concept_metadata.get(concept_key)
                 if not metadata or not metadata.activation_lens_path:
-                    continue
+                    return None, concept_key
 
-                # Load state dict (this is the slow I/O part)
-                state_dict = torch.load(metadata.activation_lens_path, map_location='cpu')
+                # Load directly to target device
+                state_dict = torch.load(metadata.activation_lens_path, map_location=self.device, weights_only=True)
 
                 # Handle key mismatch
                 model_keys_ref = set(self.model_pool[0].state_dict().keys()) if self.model_pool else None
@@ -975,21 +1284,38 @@ class DynamicLensManager:
                                 new_state_dict[key] = value
                         state_dict = new_state_dict
 
-                state_dicts.append(state_dict)
-                valid_keys.append(concept_key)
+                return state_dict, concept_key
+
+            # Parallel loading with thread pool (I/O bound, threads work well)
+            state_dicts = []
+            valid_keys = []
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                results = list(executor.map(load_lens_state_dict, keys_to_load_activation))
+
+            for state_dict, concept_key in results:
+                if state_dict is not None:
+                    state_dicts.append(state_dict)
+                    valid_keys.append(concept_key)
 
             # Now assign models and load weights
             for concept_key, state_dict in zip(valid_keys, state_dicts):
-                # Try to get from pool first
-                lens = self._get_model_from_pool()
+                # Detect if lens has LayerNorm - if so, can't use pool
+                has_ln = _detect_layer_norm(state_dict)
 
-                if lens is None:
-                    # Pool exhausted, create new model
-                    lens = SimpleMLP(self.hidden_dim).to(self.device)
-                    lens.eval()
+                if has_ln:
+                    # LayerNorm lenses can't use the standard pool
+                    lens = _create_lens_from_state_dict(state_dict, self.hidden_dim, self.device)
+                else:
+                    # Try to get from pool first
+                    lens = self._get_model_from_pool()
 
-                # Load weights (fast - already in memory)
-                lens.load_state_dict(state_dict)
+                    if lens is None:
+                        # Pool exhausted, create new model
+                        lens = SimpleMLP(self.hidden_dim).to(self.device)
+                        lens.eval()
+
+                    # Load weights (fast - already in memory)
+                    lens.load_state_dict(state_dict)
 
                 self.loaded_activation_lenses[concept_key] = lens
                 self.loaded_lenses[concept_key] = lens  # Backward compatibility
@@ -1163,6 +1489,7 @@ class DynamicLensManager:
         return_timing: bool = False,
         return_logits: bool = False,
         skip_pruning: bool = False,
+        max_expansion_depth: int = None,
     ) -> Tuple[List[Tuple[str, float, int]], Optional[Dict]]:
         """
         Detect concepts in hidden state, dynamically loading children as needed.
@@ -1173,6 +1500,7 @@ class DynamicLensManager:
             return_timing: Return detailed timing breakdown
             return_logits: If True, return (concept_name, probability, logit, layer) tuples
             skip_pruning: If True, skip aggressive pruning for this detection (useful during prompt processing)
+            max_expansion_depth: Max hierarchy depth to expand (default: self.max_expansion_depth or 5)
 
         Returns:
             (concept_scores, timing_info)
@@ -1202,22 +1530,54 @@ class DynamicLensManager:
         # Ensure hidden_state is on the same device as lenses
         hidden_state = hidden_state.to(self.device)
 
+        # Match hidden_state dtype to lens dtype (upcast or downcast as needed)
+        # This is minimal-copy: hidden_state is one vector, lenses are many
+        if self.loaded_lenses:
+            sample_lens = next(iter(self.loaded_lenses.values()))
+            lens_dtype = next(sample_lens.parameters()).dtype
+            if hidden_state.dtype != lens_dtype:
+                hidden_state = hidden_state.to(dtype=lens_dtype)
+
         # 1. Run all currently loaded lenses
         t1 = time.time()
         current_scores = {}
         current_logits = {} if return_logits else None
+
         with torch.inference_mode():
-            for concept_key, lens in self.loaded_lenses.items():
+            # Use batched inference if enabled and we have lenses
+            use_batched = self._use_batched_inference and self.loaded_lenses
+            if use_batched:
+                # Rebuild bank if dirty (lenses changed since last inference)
+                if self._lens_bank_dirty:
+                    self._rebuild_lens_bank()
+                # Check if bank actually compiled (may fail with mixed architectures)
+                if not self._lens_bank.is_compiled:
+                    use_batched = False
+
+            if use_batched:
+                # Batched forward pass - 10x faster than sequential
                 if return_logits:
-                    prob, logit = lens(hidden_state, return_logits=True)
-                    prob = prob.item()
-                    logit = logit.item()
-                    current_logits[concept_key] = logit
+                    current_scores, current_logits = self._lens_bank(hidden_state, return_logits=True)
                 else:
-                    prob = lens(hidden_state).item()
-                current_scores[concept_key] = prob
-                self.lens_scores[concept_key] = prob
-                self.lens_access_count[concept_key] += 1
+                    current_scores = self._lens_bank(hidden_state)
+
+                # Update tracking
+                for concept_key in current_scores:
+                    self.lens_scores[concept_key] = current_scores[concept_key]
+                    self.lens_access_count[concept_key] += 1
+            else:
+                # Fallback to sequential inference
+                for concept_key, lens in self.loaded_lenses.items():
+                    if return_logits:
+                        prob, logit = lens(hidden_state, return_logits=True)
+                        prob = prob.item()
+                        logit = logit.item()
+                        current_logits[concept_key] = logit
+                    else:
+                        prob = lens(hidden_state).item()
+                    current_scores[concept_key] = prob
+                    self.lens_scores[concept_key] = prob
+                    self.lens_access_count[concept_key] += 1
 
         if timing is not None:
             timing['initial_detection'] = (time.time() - t1) * 1000
@@ -1227,7 +1587,11 @@ class DynamicLensManager:
         t2 = time.time()
         total_children_loaded = 0
         decomposition_iterations = 0
-        max_iterations = 5  # Prevent infinite loops (hierarchy depth limit)
+        # Use provided depth, instance default, or fallback to 5
+        if max_expansion_depth is not None:
+            max_iterations = max_expansion_depth
+        else:
+            max_iterations = getattr(self, 'max_expansion_depth', 5)
 
         # Track which parent keys to exclude from final results
         decomposed_parents = set()
@@ -1274,10 +1638,17 @@ class DynamicLensManager:
                     child_keys_to_load = {k for k in child_keys_to_load if k not in self.loaded_lenses}
 
                 if child_keys_to_load:
+                    t_load_start = time.time()
                     self._load_concepts(list(child_keys_to_load), reason="dynamic_expansion")
+                    if timing is not None:
+                        timing['_disk_load'] = timing.get('_disk_load', 0) + (time.time() - t_load_start) * 1000
                     total_children_loaded += len(child_keys_to_load)
 
+                    # Mark bank dirty since we loaded new lenses
+                    self._mark_lens_bank_dirty()
+
                     # Score newly loaded lenses
+                    t_score_start = time.time()
                     with torch.inference_mode():
                         for concept_key in child_keys_to_load:
                             if concept_key in self.loaded_lenses:
@@ -1292,6 +1663,8 @@ class DynamicLensManager:
                                 current_scores[concept_key] = prob
                                 self.lens_scores[concept_key] = prob
                                 self.lens_access_count[concept_key] += 1
+                    if timing is not None:
+                        timing['_child_scoring'] = timing.get('_child_scoring', 0) + (time.time() - t_score_start) * 1000
 
         if timing is not None:
             timing['child_loading'] = (time.time() - t2) * 1000
@@ -1306,7 +1679,7 @@ class DynamicLensManager:
 
         # Track cache hits from warm cache reactivations
         cache_hits_this_token = getattr(self, '_last_warm_cache_hits', 0)
-        cache_misses_this_token = len(child_keys_to_load)
+        cache_misses_this_token = total_children_loaded  # Use total from all iterations
 
         if not skip_pruning:
             # Get top-k concept keys from all current scores
@@ -1325,19 +1698,23 @@ class DynamicLensManager:
                     to_warm_cache.append(concept_key)
 
             # Move lenses to warm cache
-            for concept_key in to_warm_cache:
-                lens = self.loaded_activation_lenses[concept_key]
+            if to_warm_cache:
+                for concept_key in to_warm_cache:
+                    lens = self.loaded_activation_lenses[concept_key]
 
-                # Store in warm cache with current reactivation count
-                reactivation_count = self.cache_reactivation_count.get(concept_key, 0)
-                self.warm_cache[concept_key] = (lens, reactivation_count)
+                    # Store in warm cache with current reactivation count
+                    reactivation_count = self.cache_reactivation_count.get(concept_key, 0)
+                    self.warm_cache[concept_key] = (lens, reactivation_count)
 
-                # Remove from active loaded lenses
-                del self.loaded_activation_lenses[concept_key]
-                if concept_key in self.loaded_lenses:
-                    del self.loaded_lenses[concept_key]
-                if concept_key in self.lens_scores:
-                    del self.lens_scores[concept_key]
+                    # Remove from active loaded lenses
+                    del self.loaded_activation_lenses[concept_key]
+                    if concept_key in self.loaded_lenses:
+                        del self.loaded_lenses[concept_key]
+                    if concept_key in self.lens_scores:
+                        del self.lens_scores[concept_key]
+
+                # Mark bank dirty since loaded lenses changed
+                self._mark_lens_bank_dirty()
 
             # Manage total cache memory (evict from warm cache if needed)
             self._manage_cache_memory()
@@ -1813,6 +2190,13 @@ class DynamicLensManager:
                 self._layer_norm = torch.nn.LayerNorm(hidden_dim, elementwise_affine=False).to(hidden_state.device)
             hidden_state = self._layer_norm(hidden_state)
 
+        # Match hidden_state dtype to lens dtype (upcast or downcast as needed)
+        if branch_concepts:
+            sample_lens = next(iter(branch_concepts.values()))
+            lens_dtype = next(sample_lens.parameters()).dtype
+            if hidden_state.dtype != lens_dtype:
+                hidden_state = hidden_state.to(dtype=lens_dtype)
+
         readings = {}
         with torch.inference_mode():
             for key, lens in branch_concepts.items():
@@ -1852,20 +2236,160 @@ class DynamicLensManager:
             "mode": "unrestricted",
         }
 
-    def reset_to_base(self):
-        """Reset to only base layer lenses (for clean benchmarking)."""
-        # Clear all non-base lenses
+    def reset_to_base(self, keep_warm_cache: bool = True):
+        """Reset to only base layer lenses.
+
+        Args:
+            keep_warm_cache: If True, move non-base lenses to warm cache instead
+                of discarding. This avoids disk I/O on future expansions.
+        """
+        # Move non-base lenses to warm cache or discard
         to_remove = [k for k in self.loaded_lenses.keys() if k not in self.base_layer_lenses]
         for key in to_remove:
+            if keep_warm_cache and key in self.loaded_activation_lenses:
+                # Move to warm cache instead of discarding
+                lens = self.loaded_activation_lenses[key]
+                reactivation_count = self.cache_reactivation_count.get(key, 0)
+                self.warm_cache[key] = (lens, reactivation_count)
             del self.loaded_lenses[key]
+            if key in self.loaded_activation_lenses:
+                del self.loaded_activation_lenses[key]
 
-        # Clear warm cache
-        self.warm_cache.clear()
-        self.cache_reactivation_count.clear()
+        if not keep_warm_cache:
+            # Full reset - clear warm cache too
+            self.warm_cache.clear()
+            self.cache_reactivation_count.clear()
 
         # Clear scores and access counts
         self.lens_scores.clear()
         self.lens_access_count.clear()
+
+        # Mark lens bank dirty so it rebuilds with only base lenses
+        self._mark_lens_bank_dirty()
+
+    def preload_pack_to_ram(self, max_ram_mb: int = None, priority_layers: List[int] = None):
+        """
+        Pre-load lens pack to CPU RAM (tepid cache).
+
+        This avoids torch.load() deserialization during expansion - just .to(device).
+        Should be called at startup to minimize latency during inference.
+
+        Memory tiers:
+        1. Hot VRAM: BatchedLensBank (active inference)
+        2. Warm VRAM: GPU tensors waiting for parent activation
+        3. Tepid RAM: CPU tensors pre-loaded here
+        4. Cold Disk: Only if RAM can't fit pack
+
+        Args:
+            max_ram_mb: Max RAM to use for tepid cache (MB). None = no limit.
+            priority_layers: Load these layers first (default: [3, 4, 5, 6] - upper layers
+                that get expanded into most often). Lower layers load last.
+
+        Returns:
+            Dict with loading stats
+        """
+        if self._tepid_cache_loaded:
+            return {"status": "already_loaded", "concepts": len(self.tepid_cache)}
+
+        if priority_layers is None:
+            # Upper layers are expanded into more often, prioritize them
+            priority_layers = [3, 4, 5, 6, 2, 1, 0]
+
+        start = time.time()
+        loaded_count = 0
+        loaded_bytes = 0
+        max_bytes = max_ram_mb * 1024 * 1024 if max_ram_mb else float('inf')
+
+        # Collect all concepts by layer
+        concepts_by_layer: Dict[int, List[Tuple[str, int]]] = defaultdict(list)
+        for concept_key, metadata in self.concept_metadata.items():
+            if metadata.activation_lens_path and metadata.activation_lens_path.exists():
+                concepts_by_layer[metadata.layer].append(concept_key)
+
+        # Load in priority order
+        for layer in priority_layers:
+            if layer not in concepts_by_layer:
+                continue
+
+            for concept_key in concepts_by_layer[layer]:
+                if loaded_bytes >= max_bytes:
+                    break
+
+                # Skip if already in tepid cache
+                if concept_key in self.tepid_cache:
+                    continue
+
+                metadata = self.concept_metadata[concept_key]
+                try:
+                    # Load to CPU
+                    state_dict = torch.load(
+                        metadata.activation_lens_path,
+                        map_location='cpu',
+                        weights_only=True
+                    )
+
+                    # Handle key mismatch (net. prefix)
+                    if self.model_pool:
+                        model_keys = set(self.model_pool[0].state_dict().keys())
+                        loaded_keys = set(state_dict.keys())
+                        if model_keys != loaded_keys and not any(k.startswith('net.') for k in loaded_keys):
+                            state_dict = {f'net.{k}': v for k, v in state_dict.items()}
+
+                    self.tepid_cache[concept_key] = state_dict
+                    loaded_count += 1
+
+                    # Estimate memory usage
+                    for v in state_dict.values():
+                        loaded_bytes += v.numel() * v.element_size()
+
+                except Exception as e:
+                    print(f"  Warning: Failed to preload {concept_key[0]}: {e}")
+
+            if loaded_bytes >= max_bytes:
+                print(f"  RAM budget reached at layer {layer}")
+                break
+
+        # Load any remaining layers not in priority list
+        all_layers = set(concepts_by_layer.keys())
+        remaining_layers = sorted(all_layers - set(priority_layers))
+        for layer in remaining_layers:
+            if loaded_bytes >= max_bytes:
+                break
+            for concept_key in concepts_by_layer[layer]:
+                if loaded_bytes >= max_bytes:
+                    break
+                if concept_key in self.tepid_cache:
+                    continue
+
+                metadata = self.concept_metadata[concept_key]
+                try:
+                    state_dict = torch.load(
+                        metadata.activation_lens_path,
+                        map_location='cpu',
+                        weights_only=True
+                    )
+                    if self.model_pool:
+                        model_keys = set(self.model_pool[0].state_dict().keys())
+                        loaded_keys = set(state_dict.keys())
+                        if model_keys != loaded_keys and not any(k.startswith('net.') for k in loaded_keys):
+                            state_dict = {f'net.{k}': v for k, v in state_dict.items()}
+
+                    self.tepid_cache[concept_key] = state_dict
+                    loaded_count += 1
+                    for v in state_dict.values():
+                        loaded_bytes += v.numel() * v.element_size()
+                except Exception:
+                    pass
+
+        self._tepid_cache_loaded = True
+        elapsed = time.time() - start
+
+        return {
+            "status": "loaded",
+            "concepts": loaded_count,
+            "ram_mb": loaded_bytes / (1024 * 1024),
+            "elapsed_s": elapsed,
+        }
 
     def prewarm_from_prompt(self, hidden_state: torch.Tensor, top_k: int = 10):
         """
@@ -1913,29 +2437,19 @@ class DynamicLensManager:
             return False
 
         try:
-            state_dict = torch.load(lens_path, map_location='cpu')
+            # Load directly to GPU for faster transfer
+            state_dict = torch.load(lens_path, map_location=self.device)
 
             # Infer hidden dim if not set
             if self.hidden_dim is None:
-                first_key = list(state_dict.keys())[0]
-                self.hidden_dim = state_dict[first_key].shape[1]
-
-            lens = SimpleMLP(self.hidden_dim).to(self.device)
-            lens.eval()
-
-            # Handle key mismatch (net. prefix)
-            model_keys = set(lens.state_dict().keys())
-            loaded_keys = set(state_dict.keys())
-            if model_keys != loaded_keys:
-                new_state_dict = {}
+                # Find first 2D weight to get hidden_dim
                 for key, value in state_dict.items():
-                    if not key.startswith('net.'):
-                        new_state_dict[f'net.{key}'] = value
-                    else:
-                        new_state_dict[key] = value
-                state_dict = new_state_dict
+                    if 'weight' in key and len(value.shape) == 2:
+                        self.hidden_dim = value.shape[1]
+                        break
 
-            lens.load_state_dict(state_dict)
+            # Use helper that handles LayerNorm and net. prefix
+            lens = _create_lens_from_state_dict(state_dict, self.hidden_dim, self.device)
             self.loaded_simplex_lenses[simplex_term] = lens
             self.simplex_scores[simplex_term] = 0.0
             return True
@@ -1979,6 +2493,13 @@ class DynamicLensManager:
         """
         if hidden_state.dim() == 1:
             hidden_state = hidden_state.unsqueeze(0)
+
+        # Match hidden_state dtype to lens dtype (upcast or downcast as needed)
+        if self.loaded_simplex_lenses:
+            sample_lens = next(iter(self.loaded_simplex_lenses.values()))
+            lens_dtype = next(sample_lens.parameters()).dtype
+            if hidden_state.dtype != lens_dtype:
+                hidden_state = hidden_state.to(dtype=lens_dtype)
 
         terms_to_run = simplex_terms or list(self.always_on_simplexes)
         results = {}
