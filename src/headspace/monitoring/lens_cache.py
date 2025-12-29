@@ -53,6 +53,7 @@ class LensCacheManager:
 
         # Hot tier: actively loaded lenses
         self.loaded_activation_lenses: Dict[Tuple[str, int], nn.Module] = {}
+        self.loaded_text_lenses: Dict[Tuple[str, int], nn.Module] = {}  # Text similarity lenses
         self.loaded_lenses = self.loaded_activation_lenses  # Alias for backward compat
         self.lens_scores: Dict[Tuple[str, int], float] = {}
         self.lens_access_count: Dict[Tuple[str, int], int] = defaultdict(int)

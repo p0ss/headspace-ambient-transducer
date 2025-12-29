@@ -194,6 +194,7 @@ class DynamicLensManager:
 
         # Aliases for backward compatibility
         self.loaded_activation_lenses = self.cache.loaded_activation_lenses
+        self.loaded_text_lenses = self.cache.loaded_text_lenses
         self.loaded_lenses = self.cache.loaded_lenses
         self.lens_scores = self.cache.lens_scores
         self.lens_access_count = self.cache.lens_access_count
