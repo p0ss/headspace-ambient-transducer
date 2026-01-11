@@ -295,7 +295,7 @@ class MetadataLoader:
         """
         layer_files = sorted(self.layers_data_dir.glob("layer*.json"))
 
-        # First pass: collect concepts and find best layer for each
+        # First pass: collect concepts and find best layer for each from layer JSON files
         concept_to_best_layer = {}
 
         for layer_file in layer_files:
@@ -328,7 +328,7 @@ class MetadataLoader:
                 else:
                     concept_to_best_layer[sumo_term] = (layer, concept)
 
-        # Second pass: create metadata with lens paths
+        # Second pass: create metadata with lens paths from layer JSON files
         concept_metadata = {}
         total_concepts = 0
         skipped_no_lens = 0
@@ -364,11 +364,95 @@ class MetadataLoader:
             concept_metadata[(sumo_term, layer)] = metadata
             total_concepts += 1
 
-        print(f"\n✓ Loaded metadata for {total_concepts} concepts across {len(layer_files)} layers")
+        print(f"\n✓ Loaded metadata for {total_concepts} concepts from {len(layer_files)} layer JSON files")
         if skipped_no_lens > 0:
             print(f"  Skipped {skipped_no_lens} concepts without lenses")
 
+        # Third pass: scan lens pack directories directly for additional lenses
+        # This finds lenses that don't have corresponding layer JSON files
+        if self.using_lens_pack:
+            additional_concepts = self._scan_lens_pack_directories(concept_metadata)
+            if additional_concepts > 0:
+                total_concepts += additional_concepts
+                print(f"  Discovered {additional_concepts} additional concepts from lens pack directories")
+
+        print(f"✓ Total concepts available: {len(concept_metadata)}")
         return concept_metadata
+
+    def _scan_lens_pack_directories(
+        self,
+        existing_metadata: Dict[Tuple[str, int], ConceptMetadata]
+    ) -> int:
+        """
+        Scan lens pack layer directories for lenses not in layer JSON files.
+
+        This handles cases where the lens pack has more layers than the concept pack
+        (e.g., lens pack has layer0-6 but concept pack only has layer0-4.json).
+
+        Args:
+            existing_metadata: Already discovered metadata to add to
+
+        Returns:
+            Number of additional concepts discovered
+        """
+        additional_count = 0
+        existing_terms = {key[0] for key in existing_metadata.keys()}
+
+        # Find all layer directories in lens pack
+        layer_dirs = sorted(self.lenses_dir.glob("layer*"))
+
+        for layer_dir in layer_dirs:
+            if not layer_dir.is_dir():
+                continue
+
+            try:
+                layer = int(layer_dir.name.replace('layer', ''))
+            except ValueError:
+                continue
+
+            # Scan for .pt files in this layer
+            for lens_file in layer_dir.glob("*.pt"):
+                # Extract concept name from filename
+                # Handle both "ConceptName.pt" and "ConceptName_classifier.pt" formats
+                filename = lens_file.stem
+                if filename.endswith('_classifier'):
+                    sumo_term = filename[:-11]  # Remove '_classifier'
+                else:
+                    sumo_term = filename
+
+                concept_key = (sumo_term, layer)
+
+                # Skip if already in metadata
+                if concept_key in existing_metadata:
+                    continue
+
+                # Skip if this term exists at a different layer (prefer existing)
+                if sumo_term in existing_terms:
+                    continue
+
+                # Create minimal metadata for this lens
+                metadata = ConceptMetadata(
+                    sumo_term=sumo_term,
+                    layer=layer,
+                    category_children=[],
+                    parent_concepts=[],
+                    synset_count=0,
+                    sumo_depth=layer,  # Approximate depth from layer
+                )
+                metadata.activation_lens_path = lens_file
+                metadata.has_activation_lens = True
+
+                # Check for text lens
+                text_lens_path = self._find_text_lens_path(sumo_term, layer)
+                if text_lens_path:
+                    metadata.text_lens_path = text_lens_path
+                    metadata.has_text_lens = True
+
+                existing_metadata[concept_key] = metadata
+                existing_terms.add(sumo_term)
+                additional_count += 1
+
+        return additional_count
 
     def _find_lens_path(self, sumo_term: str, layer: int) -> Tuple[bool, Optional[Path]]:
         """Find activation lens path for a concept."""

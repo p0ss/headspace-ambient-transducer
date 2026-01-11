@@ -170,8 +170,23 @@ class DynamicLensManager:
             self._auto_detect_lens_pack(lenses_dir)
         else:
             self.lenses_dir = lenses_dir
-            self.activation_lenses_dir = None
-            self.text_lenses_dir = None
+            # Detect if this is a lens pack structure (has layer directories or pack.json)
+            self.using_lens_pack = self._detect_lens_pack_structure(lenses_dir)
+            if self.using_lens_pack:
+                # Check for pack.json to get lens paths
+                pack_json = lenses_dir / "pack.json"
+                if pack_json.exists():
+                    with open(pack_json) as f:
+                        pack_data = json.load(f)
+                    lens_paths = pack_data.get("lens_paths", {})
+                    self.activation_lenses_dir = lenses_dir / lens_paths.get("activation_lenses", "activation_lenses")
+                    self.text_lenses_dir = lenses_dir / lens_paths.get("text_lenses", "text_lenses")
+                else:
+                    self.activation_lenses_dir = lenses_dir / "activation_lenses"
+                    self.text_lenses_dir = lenses_dir / "text_lenses"
+            else:
+                self.activation_lenses_dir = None
+                self.text_lenses_dir = None
 
         # === INITIALIZE MODULAR COMPONENTS ===
 
@@ -351,6 +366,36 @@ class DynamicLensManager:
             self.text_lenses_dir = pack_path / "text_lenses"
 
         self.using_lens_pack = True
+
+    def _detect_lens_pack_structure(self, lenses_dir: Path) -> bool:
+        """
+        Detect if a directory is a lens pack structure.
+
+        A lens pack has either:
+        - pack.json or pack_info.json file
+        - layer* directories (layer0/, layer1/, etc.)
+
+        Args:
+            lenses_dir: Directory to check
+
+        Returns:
+            True if this appears to be a lens pack
+        """
+        # Check for pack files
+        if (lenses_dir / "pack.json").exists():
+            return True
+        if (lenses_dir / "pack_info.json").exists():
+            return True
+
+        # Check for layer directories
+        layer_dirs = list(lenses_dir.glob("layer*"))
+        if layer_dirs:
+            # Verify at least one is a directory with .pt files
+            for layer_dir in layer_dirs:
+                if layer_dir.is_dir() and list(layer_dir.glob("*.pt")):
+                    return True
+
+        return False
 
     def _load_all_metadata(self):
         """Load metadata for all concepts."""
