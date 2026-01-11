@@ -671,12 +671,26 @@ class DynamicLensManager:
 
             concept_name, layer = concept_key
 
-            # Apply calibration normalization if available
+            # Apply calibration normalization
+            # Uncalibrated concepts get a default conservative calibration (confidence=0)
+            # which pulls scores toward 0.5 (noise floor). This prevents uncalibrated
+            # over-firers from dominating top-k with raw 100% scores.
             display_prob = prob
-            if calibration_data:
-                cal_key = f"{concept_name}_L{layer}"
-                if cal_key in calibration_data:
-                    display_prob = calibration_data[cal_key].normalize(prob)
+            cal_key = f"{concept_name}_L{layer}"
+
+            if calibration_data and cal_key in calibration_data:
+                # Use specific calibration for this concept
+                display_prob = calibration_data[cal_key].normalize(prob)
+            elif use_calibration:
+                # Default calibration for uncalibrated concepts: pull to 0.5
+                # Use high cross_fire_rate (1.0) to give confidence=0
+                # This applies whether calibration_data is None or concept is missing
+                from .deployment_manifest import ConceptCalibration
+                default_cal = ConceptCalibration(
+                    self_mean=0.9, cross_mean=0.5, self_std=0.1, cross_std=0.2,
+                    cross_fire_rate=1.0, gen_fire_rate=1.0  # confidence=0
+                )
+                display_prob = default_cal.normalize(prob)
 
             if return_logits:
                 logit = current_logits.get(concept_key, 0.0)
