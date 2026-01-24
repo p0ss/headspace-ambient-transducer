@@ -436,7 +436,18 @@ class DynamicLensManager:
 
     def _load_base_layers(self):
         """Load base layers for broad coverage."""
-        if self.manifest_resolver is not None:
+        # Check if this is a polar lens pack (no hierarchical expansion)
+        is_polar_pack = any(meta.is_polar for meta in self.concept_metadata.values())
+
+        if is_polar_pack:
+            # For polar packs, load all concepts (or up to max_loaded_lenses)
+            # Since polar packs don't use hierarchical expansion
+            all_keys = list(self.concept_metadata.keys())
+            max_to_load = min(len(all_keys), self.cache.max_loaded_lenses)
+            keys_to_load = all_keys[:max_to_load]
+            self._load_concepts(keys_to_load, reason="polar_base")
+            print(f"  Polar pack: loaded {len(keys_to_load)} concepts")
+        elif self.manifest_resolver is not None:
             # Use manifest's always_load_layers, not the parameter
             # Skip sibling expansion - let detect_and_expand handle it dynamically
             always_load = self.manifest.layer_bounds.always_load_layers
@@ -669,22 +680,26 @@ class DynamicLensManager:
             if concept_key in decomposed_parents:
                 continue
 
-            concept_name, layer = concept_key
+            concept_name, model_layer = concept_key
+
+            # Get ontological level from metadata (defaults to model_layer for backward compat)
+            metadata = self.concept_metadata.get(concept_key)
+            ontological_level = metadata.ontological_level if metadata else model_layer
 
             # Apply calibration normalization
             # Uncalibrated concepts get a default conservative calibration (confidence=0)
             # which pulls scores toward 0.5 (noise floor). This prevents uncalibrated
             # over-firers from dominating top-k with raw 100% scores.
             display_prob = prob
-            cal_key = f"{concept_name}_L{layer}"
+            cal_key = f"{concept_name}_L{model_layer}"
 
             if calibration_data and cal_key in calibration_data:
                 # Use specific calibration for this concept
                 display_prob = calibration_data[cal_key].normalize(prob)
-            elif use_calibration:
-                # Default calibration for uncalibrated concepts: pull to 0.5
-                # Use high cross_fire_rate (1.0) to give confidence=0
-                # This applies whether calibration_data is None or concept is missing
+            elif use_calibration and calibration_data is not None:
+                # Default calibration for uncalibrated concepts within a calibrated manifest
+                # Only apply when we have a manifest with calibration data - otherwise
+                # we have no reference for what "calibrated" means (e.g., polar packs)
                 from .deployment_manifest import ConceptCalibration
                 default_cal = ConceptCalibration(
                     self_mean=0.9, cross_mean=0.5, self_std=0.1, cross_std=0.2,
@@ -692,11 +707,12 @@ class DynamicLensManager:
                 )
                 display_prob = default_cal.normalize(prob)
 
+            # Report ontological level (not model layer) in results
             if return_logits:
                 logit = current_logits.get(concept_key, 0.0)
-                results.append((concept_name, display_prob, logit, layer))
+                results.append((concept_name, display_prob, logit, ontological_level))
             else:
-                results.append((concept_name, display_prob, layer))
+                results.append((concept_name, display_prob, ontological_level))
 
         results.sort(key=lambda x: x[1], reverse=True)
         top_k_results = results[:top_k]
