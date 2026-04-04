@@ -113,7 +113,10 @@ class BatchedLensBank(nn.Module):
         self.has_layer_norm = False
 
         # Track polar concepts (those with positive/negative pairs)
+        # polar_concept_indices: set of original concept indices that are polar
+        # polar_index_order: list preserving the ORDER they were added (for weight tensor indexing)
         self.polar_concept_indices: Set[int] = set()
+        self.polar_index_order: List[int] = []
 
         # Batched weight tensors (registered as buffers, not parameters)
         self.register_buffer('LN_w', None)  # [N, input_dim] - LayerNorm weights (optional)
@@ -239,7 +242,9 @@ class BatchedLensBank(nn.Module):
         self.b3 = torch.stack(b3_list).to(self.device)
 
         # Store polar concept indices
+        # polar_index_order preserves the iteration order for correct weight tensor indexing
         self.polar_concept_indices = set(polar_indices)
+        self.polar_index_order = polar_indices  # Preserve order!
         self.has_polar_lenses = len(polar_indices) > 0
 
         # Stack negative pole weights if we have polar lenses
@@ -261,6 +266,7 @@ class BatchedLensBank(nn.Module):
         self.concept_keys = []
         self.has_layer_norm = False
         self.polar_concept_indices = set()
+        self.polar_index_order = []
         self.has_polar_lenses = False
 
         # Clear main weights
@@ -375,7 +381,9 @@ class BatchedLensBank(nn.Module):
         polar_details = {}
 
         # Map from concept index to polar index (for negative probs lookup)
-        polar_idx_map = {orig_idx: polar_idx for polar_idx, orig_idx in enumerate(sorted(self.polar_concept_indices))}
+        # CRITICAL: Use polar_index_order (iteration order) NOT sorted order!
+        # The negative weight tensors were stacked in iteration order during add_lenses.
+        polar_idx_map = {orig_idx: polar_idx for polar_idx, orig_idx in enumerate(self.polar_index_order)}
 
         for i, key in enumerate(self.concept_keys):
             pos_prob = float(probs[i].item())
