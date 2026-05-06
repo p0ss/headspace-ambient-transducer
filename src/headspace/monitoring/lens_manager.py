@@ -287,6 +287,68 @@ class DynamicLensManager:
         if self.manifest:
             print(f"  Manifest: {self.manifest.manifest_id}")
         self._load_base_layers()
+        self._auto_load_simplexes_from_pack()
+
+    def _auto_load_simplexes_from_pack(self):
+        """
+        Auto-load any simplexes packaged under {lenses_dir}/simplex/.
+
+        Recognises two layouts:
+        - Tripole directory:
+              simplex/{name}/{positive,neutral,negative}/{name}_{pole}_classifier.pt
+          → loaded via load_tripole_simplex; tripole binding self-registered with
+          always_on=True so all three poles fire alongside hierarchical detection.
+        - Legacy single file:
+              simplex/{name}_tripole.pt
+          → loaded via load_simplex; not auto-bound (caller responsibility).
+
+        Silent no-op if simplex/ doesn't exist in the pack. Hush controllers
+        loading specific required_simplexes via _load_required_simplexes still
+        work as before; this is additive auto-load for observability.
+        """
+        if not hasattr(self, 'lenses_dir') or self.lenses_dir is None:
+            return
+
+        simplex_dir = Path(self.lenses_dir) / "simplex"
+        if not simplex_dir.exists() or not simplex_dir.is_dir():
+            return
+
+        if self.hidden_dim is not None:
+            self.simplex.set_hidden_dim(self.hidden_dim)
+
+        tripole_loaded: List[str] = []
+        legacy_loaded: List[str] = []
+
+        for child in sorted(simplex_dir.iterdir()):
+            if child.is_dir():
+                simplex_name = child.name
+                results = self.simplex.load_tripole_simplex(simplex_name, child)
+                if all(results.values()):
+                    self.simplex.register_tripole_binding(
+                        concept_term=simplex_name,
+                        simplex_name=simplex_name,
+                        always_on=True,
+                    )
+                    tripole_loaded.append(simplex_name)
+            elif (
+                child.is_file()
+                and child.suffix == '.pt'
+                and child.name.endswith('_tripole.pt')
+            ):
+                simplex_term = child.stem[: -len('_tripole')]
+                if self.simplex.load_simplex(simplex_term, child):
+                    legacy_loaded.append(simplex_term)
+
+        if tripole_loaded:
+            print(
+                f"✓ Auto-loaded {len(tripole_loaded)} tripole simplex(es): "
+                f"{', '.join(tripole_loaded)}"
+            )
+        if legacy_loaded:
+            print(
+                f"✓ Auto-loaded {len(legacy_loaded)} legacy simplex(es): "
+                f"{', '.join(legacy_loaded)}"
+            )
 
     def _setup_lens_pack(self, lens_pack_id: str, lenses_dir: Path):
         """Setup lens pack from ID."""
@@ -574,6 +636,16 @@ class DynamicLensManager:
         if timing is not None:
             timing['initial_detection'] = (time.time() - t1) * 1000
 
+        # 1.5 Run simplex/tripole lenses on the same hidden state.
+        # Independent of hierarchical decomposition; updates SimplexManager's
+        # state stores (scores + rolling baselines). Runs whichever simplexes
+        # are registered as always_on; cheap if none are loaded.
+        if self.simplex.loaded_simplex_lenses:
+            t_simplex = time.time()
+            self.simplex.detect(hidden_state)
+            if timing is not None:
+                timing['simplex_detection'] = (time.time() - t_simplex) * 1000
+
         # 2. Iterative decomposition: replace parents with children
         t2 = time.time()
         total_children_loaded = 0
@@ -853,6 +925,26 @@ class DynamicLensManager:
     def get_all_simplex_activations(self):
         """Get current activations for all loaded simplexes."""
         return self.simplex.get_all_activations()
+
+    def load_tripole_simplex(self, simplex_name: str, simplex_dir: Path) -> Dict[str, bool]:
+        """Load all three poles of a tripole simplex from a directory."""
+        return self.simplex.load_tripole_simplex(simplex_name, simplex_dir)
+
+    def register_tripole_binding(self, concept_term: str, simplex_name: str, always_on: bool = False):
+        """Register a binding between a concept and a tripole simplex."""
+        self.simplex.register_tripole_binding(concept_term, simplex_name, always_on)
+
+    def get_tripole_state(self, simplex_name: str) -> Dict[str, float]:
+        """Get current activations for all three poles of a tripole simplex."""
+        return self.simplex.get_tripole_state(simplex_name)
+
+    def get_tripole_deviation(self, simplex_name: str) -> Dict[str, Optional[float]]:
+        """Get current deviation from baseline for all three poles."""
+        return self.simplex.get_tripole_deviation(simplex_name)
+
+    def get_all_tripole_activations(self) -> Dict[str, Dict[str, Any]]:
+        """Get current activations grouped by logical tripole simplex name."""
+        return self.simplex.get_all_tripole_activations()
 
     # === BE WORKSPACE TOOLS ===
 
