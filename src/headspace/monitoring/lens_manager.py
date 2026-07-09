@@ -89,10 +89,21 @@ class DynamicLensManager:
 
     @staticmethod
     def discover_lens_packs(
-        lens_packs_dir: Path = Path("lens_packs"),
+        lens_packs_dir: Optional[Path] = None,
         substrate_id: Optional[str] = None
     ) -> Dict[str, Dict]:
-        """Discover all available lens packs (both legacy and MAP-compliant)."""
+        """Discover all available lens packs (both legacy and MAP-compliant).
+
+        When `lens_packs_dir` is None we resolve it from this file's location:
+        `src/lens_packs/`. This makes discovery robust to the caller's cwd
+        (uvicorn, training scripts, ad-hoc REPLs all worked previously only
+        because a top-level `lens_packs -> src/lens_packs` symlink was present).
+        """
+        if lens_packs_dir is None:
+            # lens_manager.py lives at src/hat/monitoring/, so parent×3 = src/
+            lens_packs_dir = (
+                Path(__file__).resolve().parent.parent.parent / "lens_packs"
+            )
         packs = {}
         if not lens_packs_dir.exists():
             return packs
@@ -251,6 +262,16 @@ class DynamicLensManager:
                 self.manifest = DeploymentManifest.default("auto-calibrated")
             count = self.manifest.load_calibration(calibration_path)
             print(f"✓ Loaded calibration for {count} concepts")
+        else:
+            # Noisy on purpose: previously this branch was silent and a
+            # path-resolution bug made calibration vanish without anyone
+            # noticing. Runtime falls back to default conservative dampening.
+            print(
+                f"⚠ No calibration.json at {calibration_path} — "
+                f"runtime will apply default conservative dampening for all "
+                f"concepts. Run scripts/run_calibration.sh on this pack to "
+                f"produce one."
+            )
 
         # === LOAD METADATA ===
         self._load_all_metadata()
