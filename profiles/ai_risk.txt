@@ -1,0 +1,11 @@
+# AI-risk watch profile (first pass).
+# Watching a concept also watches every concept beneath it in the hierarchy.
+Deception
+AIDeception
+AIStrategicDeception
+DeceptiveAlignment
+Manipulation
+PsychologicalManipulation
+CoerciveManagement
+Sabotage
+Exfiltration

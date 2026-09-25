@@ -24,6 +24,7 @@ This file is the main orchestrator that uses modular components from:
 from __future__ import annotations
 
 import json
+import os
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -94,16 +95,12 @@ class DynamicLensManager:
     ) -> Dict[str, Dict]:
         """Discover all available lens packs (both legacy and MAP-compliant).
 
-        When `lens_packs_dir` is None we resolve it from this file's location:
-        `src/lens_packs/`. This makes discovery robust to the caller's cwd
-        (uvicorn, training scripts, ad-hoc REPLs all worked previously only
-        because a top-level `lens_packs -> src/lens_packs` symlink was present).
+        When `lens_packs_dir` is None we use $HEADSPACE_LENS_PACKS_DIR if set,
+        otherwise `./lens_packs` relative to the current working directory.
         """
         if lens_packs_dir is None:
-            # lens_manager.py lives at src/hat/monitoring/, so parent×3 = src/
-            lens_packs_dir = (
-                Path(__file__).resolve().parent.parent.parent / "lens_packs"
-            )
+            env_dir = os.environ.get("HEADSPACE_LENS_PACKS_DIR")
+            lens_packs_dir = Path(env_dir) if env_dir else Path.cwd() / "lens_packs"
         packs = {}
         if not lens_packs_dir.exists():
             return packs
@@ -184,6 +181,9 @@ class DynamicLensManager:
             # Detect if this is a lens pack structure (has layer directories or pack.json)
             self.using_lens_pack = self._detect_lens_pack_structure(lenses_dir)
             if self.using_lens_pack:
+                # A self-contained pack ships its own hierarchy
+                if (lenses_dir / "hierarchy").is_dir():
+                    self.layers_data_dir = lenses_dir / "hierarchy"
                 # Check for pack.json to get lens paths
                 pack_json = lenses_dir / "pack.json"
                 if pack_json.exists():
@@ -269,8 +269,7 @@ class DynamicLensManager:
             print(
                 f"⚠ No calibration.json at {calibration_path} — "
                 f"runtime will apply default conservative dampening for all "
-                f"concepts. Run scripts/run_calibration.sh on this pack to "
-                f"produce one."
+                f"concepts. Calibrate this pack with HatCat to produce one."
             )
 
         # === LOAD METADATA ===
@@ -398,6 +397,9 @@ class DynamicLensManager:
                 if concept_pack_hierarchy.exists():
                     self.layers_data_dir = concept_pack_hierarchy
 
+        if (pack_path / "hierarchy").is_dir():
+            self.layers_data_dir = pack_path / "hierarchy"
+
         pack_json = pack_path / "pack.json"
         if pack_json.exists():
             with open(pack_json) as f:
@@ -436,6 +438,9 @@ class DynamicLensManager:
                 concept_pack_hierarchy = Path("concept_packs") / source_pack / "hierarchy"
                 if concept_pack_hierarchy.exists():
                     self.layers_data_dir = concept_pack_hierarchy
+
+        if (pack_path / "hierarchy").is_dir():
+            self.layers_data_dir = pack_path / "hierarchy"
 
         pack_json = pack_path / "pack.json"
         if pack_json.exists():
