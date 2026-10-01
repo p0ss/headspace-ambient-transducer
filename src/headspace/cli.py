@@ -1,5 +1,6 @@
 """
-headspace run  --model google/gemma-3-4b-pt --pack path/to/pack "prompt"
+headspace run    --model google/gemma-3-4b-pt --pack path/to/pack "prompt"
+headspace trace  --model google/gemma-4-E4B-it --pack path/to/pack --prompts prompts.json --output trace.json
 headspace pack add-hierarchy path/to/pack path/to/concept_pack/hierarchy
 """
 
@@ -61,6 +62,21 @@ def _cmd_run(args) -> int:
     return 0
 
 
+def _cmd_trace(args) -> int:
+    import json
+
+    from .runtime import Monitor
+    from .trace import load_prompts, record
+
+    monitor = Monitor.from_pretrained(args.model, args.pack, device=args.device, max_loaded_lenses=args.max_loaded)
+    monitor.top_k = max(args.top, 10)
+    trace = record(monitor, args.pack, load_prompts(args.prompts), max_new_tokens=args.max_new_tokens,
+                   top=args.top, chat=not args.raw, model_name=args.model)
+    Path(args.output).write_text(json.dumps(trace, separators=(",", ":")))
+    print(f"Wrote {sum(len(r['tokens']) for r in trace['runs'])} tokens across {len(trace['runs'])} prompts to {args.output}")
+    return 0
+
+
 def _cmd_add_hierarchy(args) -> int:
     from .pack import add_hierarchy
 
@@ -88,6 +104,19 @@ def main(argv=None) -> int:
     run.add_argument("--top-k", type=int, default=10)
     run.add_argument("--chat", action="store_true", help="Send the prompt through the chat template (instruct models)")
     run.set_defaults(func=_cmd_run)
+
+    trace = sub.add_parser("trace", help="Record per-token concept readings for a set of prompts as JSON")
+    trace.add_argument("--model", required=True)
+    trace.add_argument("--pack", required=True, type=Path)
+    trace.add_argument("--prompts", required=True, type=Path,
+                       help='JSON list of {"prompt", "title"?, "note"?}, or a text file with one prompt per line')
+    trace.add_argument("--output", required=True, type=Path)
+    trace.add_argument("--max-new-tokens", type=int, default=120)
+    trace.add_argument("--top", type=int, default=8, help="Detections recorded per token")
+    trace.add_argument("--raw", action="store_true", help="Continue the prompt as raw text instead of a chat turn")
+    trace.add_argument("--device", default="cuda")
+    trace.add_argument("--max-loaded", type=int, default=1000)
+    trace.set_defaults(func=_cmd_trace)
 
     pack = sub.add_parser("pack", help="Lens pack utilities")
     pack_sub = pack.add_subparsers(dest="pack_command", required=True)

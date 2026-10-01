@@ -250,3 +250,33 @@ def test_calibrated_lens_is_max_of_probe_percentiles(multi_layer_pack):
     assert d.probes[7] < 0.3                        # ~0 raw sits inside its background
     assert d.score == pytest.approx(1.0, abs=1e-3)  # max of calibrated probes
     assert monitor.watch.matches(d)
+
+
+def test_trace_records_tokens_fields_and_concepts(multi_layer_pack):
+    from transformers import LlamaConfig, LlamaForCausalLM
+    from headspace.trace import record
+
+    config = LlamaConfig(vocab_size=32, hidden_size=HIDDEN, intermediate_size=32,
+                         num_hidden_layers=8, num_attention_heads=2, num_key_value_heads=2)
+    model = LlamaForCausalLM(config).eval()
+
+    class Tokenizer:
+        eos_token_id = None
+
+        def __call__(self, text, return_tensors=None):
+            return type("Enc", (), {"input_ids": torch.tensor([[1, 2, 3]])})()
+
+        def decode(self, ids):
+            return f"<{int(ids[0])}>"
+
+    manager = DynamicLensManager(lenses_dir=multi_layer_pack, device="cpu", base_layers=[0])
+    trace = record(Monitor(model, Tokenizer(), manager), multi_layer_pack,
+                   [{"prompt": "hello", "title": "Greeting"}], max_new_tokens=3, chat=False)
+
+    assert trace["fields"] == ["Root"]
+    assert trace["concepts"]["Deception"]["parent"] == "Agent"
+    run = trace["runs"][0]
+    assert run["title"] == "Greeting" and len(run["tokens"]) == 3
+    token = run["tokens"][0]
+    assert len(token["fields"]) == 1 and token["top"]
+    assert all(set(row[2]) <= {"3", "7"} for row in token["top"])  # per-layer scores keyed by model layer
