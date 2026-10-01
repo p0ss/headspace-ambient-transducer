@@ -127,6 +127,9 @@
   .composer button { font: 700 14px var(--sans); color: var(--panel); background: var(--accent); border: 0; border-radius: 7px; padding: 8px 16px; cursor: pointer; }
   .composer button:disabled { opacity: .5; cursor: progress; }
   .composer .status { font-size: 13px; color: var(--ink-3); }
+  .composer button.secondary { color: var(--ink); background: var(--chip); font-weight: 400; }
+  .composer .tokens { font-size: 13px; color: var(--ink-2); display: inline-flex; gap: 6px; align-items: center; }
+  .composer .tokens input { width: 78px; font: 13px var(--mono); color: var(--ink); background: var(--bg); border: 1px solid var(--rule); border-radius: 6px; padding: 4px 6px; }
   @media (max-width: 860px) {
     .layout, .two { grid-template-columns: 1fr; }
     nav { position: static; }
@@ -151,9 +154,15 @@
 
     <main>
       <section class="card composer" id="composer" hidden>
-        <label class="label" for="message">Ask the model something</label>
+        <label class="label" for="message" id="message-label">Ask the model something</label>
         <textarea id="message" placeholder="e.g. How can a small manufacturer make its supply chain harder to disrupt?"></textarea>
-        <div class="row"><button id="send">Generate and watch</button><span class="status" id="status"></span></div>
+        <div class="row">
+          <button id="send">Generate and watch</button>
+          <button id="stop" class="secondary" hidden>Stop</button>
+          <label class="tokens">Max tokens <input id="max-tokens" type="number" min="16" max="4096" step="16" value="512"></label>
+          <button id="reset" class="secondary">New conversation</button>
+          <span class="status" id="status"></span>
+        </div>
       </section>
 
       <section class="card">
@@ -357,21 +366,30 @@ document.getElementById("mode-shade").onclick = () => { mode = "shade"; renderMo
 document.getElementById("mode-area").onclick = () => { mode = "area"; renderModes(); renderText(); renderHeat(); renderDetail(); };
 try { if (localStorage.getItem("hat-colour-mode") === "area") mode = "area"; } catch (e) {}
 
-// Live mode: stream a chat completion from `headspace serve` and render as tokens arrive
+// Live mode: stream a chat completion from `headspace serve` and render as tokens arrive.
+// Messages build up a conversation, so a follow-up is sent with the turns before it.
+let conversation = [], conversationNo = 1, controller = null;
+
 async function generate() {
-  const text = document.getElementById("message").value.trim();
-  if (!text) return;
-  const button = document.getElementById("send"), status = document.getElementById("status");
-  button.disabled = true; status.textContent = "Generating…";
-  const r = { title: text.length > 48 ? text.slice(0, 46) + "…" : text, prompt: text, group: "This session", tokens: [] };
+  const input = document.getElementById("message"), text = input.value.trim();
+  if (!text || controller) return;
+  const send = document.getElementById("send"), stop = document.getElementById("stop"), status = document.getElementById("status");
+  const maxTokens = Math.max(16, Math.min(4096, +document.getElementById("max-tokens").value || 512));
+  const turn = conversation.filter(m => m.role === "user").length + 1;
+  const r = { title: `${turn}. ${text.length > 42 ? text.slice(0, 40) + "…" : text}`, prompt: text,
+              group: `Conversation ${conversationNo}`, tokens: [] };
+  const messages = [...conversation, { role: "user", content: text }];
   TRACE.runs.push(r); select(TRACE.runs.length - 1);
-  let pending = false;
+  input.value = "";
+  send.disabled = true; stop.hidden = false; status.textContent = "Generating…";
+  controller = new AbortController();
+  let pending = false, reply = "";
   const redraw = () => { if (pending) return; pending = true; requestAnimationFrame(() => {
     pending = false; if (TRACE.runs[run] === r) { shade = defaultShade(r); renderText(); renderHeat(); renderProfile(); renderStats(); if (r.tokens.length === 1) renderDetail(); }
   }); };
   try {
     const res = await fetch("/v1/chat/completions", { method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ messages: [{ role: "user", content: text }], stream: true, max_tokens: 200 }) });
+      body: JSON.stringify({ messages, stream: true, max_tokens: maxTokens }), signal: controller.signal });
     if (!res.ok) throw new Error(`server returned ${res.status}`);
     const reader = res.body.getReader(), decoder = new TextDecoder();
     let buffer = "";
@@ -386,17 +404,30 @@ async function generate() {
         const delta = JSON.parse(line.slice(5)).choices[0].delta;
         const hat = delta.metadata?.hat;
         if (!hat) continue;
+        reply += delta.content;
         r.tokens.push({ t: delta.content, ms: hat.ms, loaded: hat.loaded, fields: FIELDS.map(f => hat.fields[f] ?? 0),
           top: hat.detections.map(d => [d.concept, d.score, d.probes]) });
         redraw();
       }
     }
-    status.textContent = `${r.tokens.length} tokens`;
+    status.textContent = `${r.tokens.length} tokens. Ask a follow-up, or start a new conversation.`;
   } catch (e) {
-    status.textContent = `Couldn't generate: ${e.message}. Is headspace serve running?`;
+    status.textContent = e.name === "AbortError" ? `Stopped after ${r.tokens.length} tokens.`
+      : `Couldn't generate: ${e.message}. Is headspace serve running?`;
   } finally {
-    button.disabled = false; renderAll();
+    // Keep the turn (even a stopped one) so follow-ups have the context the model actually wrote
+    if (reply) conversation = [...messages, { role: "assistant", content: clean(reply).trim() }];
+    controller = null; send.disabled = false; stop.hidden = true;
+    document.getElementById("message-label").textContent = "Ask a follow-up";
+    renderAll();
   }
+}
+
+function newConversation() {
+  if (controller) controller.abort();
+  conversation = []; conversationNo += 1;
+  document.getElementById("message-label").textContent = "Ask the model something";
+  document.getElementById("status").textContent = "";
 }
 
 async function boot() {
@@ -410,6 +441,8 @@ async function boot() {
     }
     document.getElementById("composer").hidden = false;
     document.getElementById("send").onclick = generate;
+    document.getElementById("stop").onclick = () => controller?.abort();
+    document.getElementById("reset").onclick = newConversation;
     document.getElementById("message").addEventListener("keydown", e => {
       if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) generate();
     });

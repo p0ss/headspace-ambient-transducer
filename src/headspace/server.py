@@ -53,7 +53,7 @@ class ChatRequest(BaseModel):
     model: Optional[str] = None
     messages: List[Message]
     stream: bool = True
-    max_tokens: Optional[int] = 256
+    max_tokens: Optional[int] = 512
     temperature: Optional[float] = 0.0
 
 
@@ -145,6 +145,8 @@ def create_app(monitor: Monitor, pack_dir: Path, model_name: str):
                                  "token_metadata": per_token})
 
         def events():
+            # A client that disconnects (Stop) closes this generator, which ends
+            # generation and releases the lock
             yield chunk(cid, created, {"role": "assistant", "content": ""})
             for step in run(req):
                 yield chunk(cid, created, {"content": step.token, "metadata": token_metadata(step)})
