@@ -13,7 +13,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterator, List, Optional, Sequence
+from typing import Dict, Iterator, List, Optional, Sequence, Union
 
 import torch
 
@@ -26,6 +26,8 @@ class Detection:
     score: float
     layer: int
     path: List[str]
+    # Multi-layer lenses: score per model layer. Empty for single-probe lenses.
+    probes: Dict[int, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -49,16 +51,18 @@ class WatchProfile:
     whole branch beneath it.
     """
     concepts: Sequence[str] = field(default_factory=list)
-    threshold: float = 0.5
+    # None: the Monitor picks one for the pack - 0.99 for probe-calibrated packs
+    # (score = fraction of background exceeded), 0.5 for raw probabilities
+    threshold: Optional[float] = None
 
     def matches(self, detection: Detection) -> bool:
-        if detection.score < self.threshold:
+        if detection.score < (self.threshold if self.threshold is not None else 0.5):
             return False
         watched = set(self.concepts)
         return any(name in watched for name in detection.path)
 
     @classmethod
-    def from_file(cls, path: Path, threshold: float = 0.5) -> "WatchProfile":
+    def from_file(cls, path: Path, threshold: Optional[float] = None) -> "WatchProfile":
         lines = Path(path).read_text().splitlines()
         concepts = [ln.strip() for ln in lines if ln.strip() and not ln.startswith("#")]
         return cls(concepts=concepts, threshold=threshold)
@@ -73,13 +77,22 @@ class Monitor:
         tokenizer,
         lens_manager: DynamicLensManager,
         watch: Optional[WatchProfile] = None,
-        hidden_layer: int = -1,
+        hidden_layer: Optional[int] = None,
         top_k: int = 10,
     ):
+        """
+        hidden_layer: model layer single-probe lenses read. Defaults to the
+            pack's declared `model_layer`, else the last layer. Multi-layer
+            lenses always read the model layers their probes were trained on.
+        """
         self.model = model
         self.tokenizer = tokenizer
         self.lenses = lens_manager
         self.watch = watch or WatchProfile()
+        if self.watch.threshold is None:
+            self.watch.threshold = 0.99 if getattr(lens_manager, "probe_calibrated", False) else 0.5
+        if hidden_layer is None:
+            hidden_layer = lens_manager.model_layer
         self.hidden_layer = hidden_layer
         self.top_k = top_k
 
@@ -137,20 +150,67 @@ class Monitor:
             total += sum(p.numel() * p.element_size() for p in lens.parameters())
         return total / 1e6
 
-    def read(self, hidden_state: torch.Tensor) -> tuple[List[Detection], float]:
-        """Score one hidden state [hidden_dim] or [1, hidden_dim]."""
+    @property
+    def required_model_layers(self) -> List[int]:
+        """Model layers to pass to `read` for the pack's multi-layer lenses."""
+        return self.lenses.required_model_layers
+
+    def read(
+        self,
+        hidden_state: Union[torch.Tensor, Dict[int, torch.Tensor]],
+    ) -> tuple[List[Detection], float]:
+        """
+        Score one position.
+
+        Pass a hidden state [hidden_dim] or [1, hidden_dim] for a pack of
+        single-layer lenses, or a dict of model_layer -> hidden state covering
+        `required_model_layers` (plus `hidden_layer`, if the pack also has
+        single-probe lenses).
+        """
         start = time.perf_counter()
-        results, _ = self.lenses.detect_and_expand(hidden_state.float(), top_k=self.top_k)
+        if isinstance(hidden_state, dict):
+            layer_states = {layer: h.float() for layer, h in hidden_state.items()}
+            default = layer_states.get(self.hidden_layer)
+            if default is None:
+                default = next(iter(layer_states.values()))
+        else:
+            layer_states = None
+            default = hidden_state.float()
+
+        results, _ = self.lenses.detect_and_expand(default, top_k=self.top_k, layer_states=layer_states)
         detections = [
             Detection(
                 concept=name,
                 score=float(score),
                 layer=int(layer),
                 path=self.lenses.get_concept_path(name, layer),
+                probes=self.lenses.get_probe_scores(name, layer),
             )
             for name, score, layer in results
         ]
         return detections, (time.perf_counter() - start) * 1000
+
+    def _stop_ids(self) -> set:
+        """End-of-sequence ids: the tokenizer's, plus the model's generation config (e.g. end-of-turn)."""
+        ids = {self.tokenizer.eos_token_id}
+        config = getattr(self.model, "generation_config", None)
+        eos = getattr(config, "eos_token_id", None)
+        ids.update(eos if isinstance(eos, (list, tuple)) else [eos])
+        return {i for i in ids if i is not None}
+
+    def _layer_states(self, hidden_states) -> Dict[int, torch.Tensor]:
+        """Pick the last position of each model layer the lenses read.
+
+        hidden_states[0] is the embeddings, so model layer L is hidden_states[L + 1].
+        """
+        n_layers = len(hidden_states) - 1
+        layers = set(self.required_model_layers)
+        default = self.hidden_layer if self.hidden_layer is not None else n_layers - 1
+        if default < 0:
+            default += n_layers
+        layers.add(default)
+        self.hidden_layer = default
+        return {layer: hidden_states[layer + 1][:, -1, :] for layer in layers}
 
     @torch.inference_mode()
     def generate(
@@ -158,10 +218,21 @@ class Monitor:
         prompt: str,
         max_new_tokens: int = 64,
         temperature: float = 0.0,
+        chat: bool = False,
     ) -> Iterator[Step]:
-        """Generate from `prompt`, yielding a monitoring Step per new token."""
+        """Generate from `prompt`, yielding a monitoring Step per new token.
+
+        chat: send the prompt as a user turn through the tokenizer's chat template
+        (for instruct models) instead of as raw text to continue.
+        """
         device = self.model.device
-        input_ids = self.tokenizer(prompt, return_tensors="pt").input_ids.to(device)
+        if chat:
+            input_ids = self.tokenizer.apply_chat_template(
+                [{"role": "user", "content": prompt}], add_generation_prompt=True, return_tensors="pt",
+                return_dict=True,
+            )["input_ids"].to(device)
+        else:
+            input_ids = self.tokenizer(prompt, return_tensors="pt").input_ids.to(device)
         past = None
         next_input = input_ids
 
@@ -173,7 +244,7 @@ class Monitor:
                 output_hidden_states=True,
             )
             past = out.past_key_values
-            hidden = out.hidden_states[self.hidden_layer][:, -1, :]
+            layer_states = self._layer_states(out.hidden_states)
 
             logits = out.logits[:, -1, :]
             if temperature > 0:
@@ -182,7 +253,7 @@ class Monitor:
             else:
                 token_id = logits.argmax(dim=-1, keepdim=True)
 
-            detections, ms = self.read(hidden)
+            detections, ms = self.read(layer_states)
             yield Step(
                 index=index,
                 token_id=int(token_id),
@@ -195,6 +266,6 @@ class Monitor:
                 monitor_ms=ms,
             )
 
-            if int(token_id) == self.tokenizer.eos_token_id:
+            if int(token_id) in self._stop_ids():
                 break
             next_input = token_id

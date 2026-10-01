@@ -380,10 +380,12 @@ class LensCacheManager:
         else:
             self._lens_bank.clear()
 
-        if self.loaded_lenses:
+        # Only single-layer probes batch together; multi-layer Lenses score on their own
+        single_layer = {k: l for k, l in self.loaded_lenses.items() if isinstance(l, SimpleMLP)}
+        if single_layer:
             # Include polar negative lenses if any are loaded
             negative_lenses = self.loaded_polar_negative_lenses if self.loaded_polar_negative_lenses else None
-            self._lens_bank.add_lenses(self.loaded_lenses, negative_lenses=negative_lenses)
+            self._lens_bank.add_lenses(single_layer, negative_lenses=negative_lenses)
 
         self._lens_bank_dirty = False
 
@@ -432,6 +434,9 @@ class LensCacheManager:
         # Collect concepts by layer
         concepts_by_layer: Dict[int, List[Tuple[str, int]]] = defaultdict(list)
         for concept_key, metadata in concept_metadata.items():
+            # Multi-layer lenses hold several state dicts; they load from disk instead
+            if metadata.probe_paths:
+                continue
             if metadata.activation_lens_path and metadata.activation_lens_path.exists():
                 concepts_by_layer[metadata.layer].append(concept_key)
 

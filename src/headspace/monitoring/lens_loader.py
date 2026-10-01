@@ -20,10 +20,12 @@ import torch
 import torch.nn as nn
 
 from .lens_types import (
+    Lens,
     SimpleMLP,
     ConceptMetadata,
     detect_layer_norm,
     create_lens_from_state_dict,
+    parse_probe_filename,
 )
 
 if TYPE_CHECKING:
@@ -61,6 +63,15 @@ class LensLoader:
 
         # Detect bank format
         self._detect_banked_pack()
+
+        # Per-probe calibration for multi-layer lenses: "layer<L>/<Concept>@L<n>" -> quantiles
+        self.probe_calibration: Dict[str, torch.Tensor] = {}
+        calibration_path = Path(lenses_dir) / "probe_calibration.json"
+        if calibration_path.exists():
+            with open(calibration_path) as f:
+                data = json.load(f)
+            self.probe_calibration = {k: torch.tensor(v["quantiles"]) for k, v in data["probes"].items()}
+            print(f"✓ Loaded per-probe calibration for {len(self.probe_calibration)} probes")
 
     def _detect_banked_pack(self):
         """Detect if this is a banked lens pack and load bank index."""
@@ -175,17 +186,23 @@ class LensLoader:
                     if cache_manager.hidden_dim is not None:
                         break
 
-        # Separate polar and non-polar concepts
+        # Separate polar, multi-layer and single-probe concepts
         polar_keys = []
+        multi_layer_keys = []
         standard_keys = []
         for key in keys_to_load:
             metadata = concept_metadata.get(key)
             if metadata and metadata.is_polar:
                 polar_keys.append(key)
+            elif metadata and metadata.probe_paths:
+                multi_layer_keys.append(key)
             else:
                 standard_keys.append(key)
 
         loaded_count = 0
+
+        if multi_layer_keys:
+            loaded_count += self._load_multi_layer_lenses(multi_layer_keys, concept_metadata, cache_manager)
 
         # Load standard (non-polar) lenses
         if standard_keys:
@@ -258,6 +275,36 @@ class LensLoader:
             cache_manager.stats['cache_misses'] += 1
 
         return len(valid_keys)
+
+    def _load_multi_layer_lenses(
+        self,
+        keys_to_load: List[Tuple[str, int]],
+        concept_metadata: Dict[Tuple[str, int], ConceptMetadata],
+        cache_manager: "LensCacheManager",
+    ) -> int:
+        """Load lenses with one probe per model layer, each wrapped as a Lens."""
+        def load_probes(concept_key):
+            probes = {}
+            for model_layer, path in concept_metadata[concept_key].probe_paths.items():
+                state_dict = torch.load(path, map_location=self.device, weights_only=True)
+                probes[model_layer] = create_lens_from_state_dict(state_dict, cache_manager.hidden_dim, self.device)
+            return concept_key, probes
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            results = list(executor.map(load_probes, keys_to_load))
+
+        for concept_key, probes in results:
+            term, layer = concept_key
+            calibration = {
+                model_layer: self.probe_calibration[f"layer{layer}/{term}@L{model_layer}"]
+                for model_layer in probes
+                if f"layer{layer}/{term}@L{model_layer}" in self.probe_calibration
+            }
+            lens = Lens(probes, calibration=calibration).eval()
+            cache_manager.add_to_active(concept_key, lens)
+            cache_manager.stats['cache_misses'] += 1
+
+        return len(results)
 
     def _load_polar_lenses(
         self,
@@ -538,6 +585,9 @@ class MetadataLoader:
         for sumo_term, (layer, concept) in concept_to_best_layer.items():
             # Check if lens exists
             has_lens, activation_path = self._find_lens_path(sumo_term, layer)
+            probe_paths = self._find_probe_paths(sumo_term, layer)
+            if probe_paths and not has_lens:
+                has_lens, activation_path = True, probe_paths[min(probe_paths)]
 
             if not has_lens:
                 skipped_no_lens += 1
@@ -556,6 +606,7 @@ class MetadataLoader:
             if activation_path:
                 metadata.activation_lens_path = activation_path
                 metadata.has_activation_lens = True
+            metadata.probe_paths = probe_paths
 
             # Find text lens path
             text_lens_path = self._find_text_lens_path(sumo_term, layer)
@@ -613,14 +664,10 @@ class MetadataLoader:
                 continue
 
             # Scan for .pt files in this layer
-            for lens_file in layer_dir.glob("*.pt"):
-                # Extract concept name from filename
-                # Handle both "ConceptName.pt" and "ConceptName_classifier.pt" formats
-                filename = lens_file.stem
-                if filename.endswith('_classifier'):
-                    sumo_term = filename[:-11]  # Remove '_classifier'
-                else:
-                    sumo_term = filename
+            for lens_file in sorted(layer_dir.glob("*.pt")):
+                # "ConceptName.pt", "ConceptName_classifier.pt", or one
+                # "ConceptName@L<model_layer>.pt" per probe of a multi-layer lens
+                sumo_term, _ = parse_probe_filename(lens_file.stem)
 
                 concept_key = (sumo_term, layer)
 
@@ -643,6 +690,7 @@ class MetadataLoader:
                 )
                 metadata.activation_lens_path = lens_file
                 metadata.has_activation_lens = True
+                metadata.probe_paths = self._find_probe_paths(sumo_term, layer)
 
                 # Check for text lens
                 text_lens_path = self._find_text_lens_path(sumo_term, layer)
@@ -682,6 +730,15 @@ class MetadataLoader:
                 return True, activation_path
 
         return False, None
+
+    def _find_probe_paths(self, sumo_term: str, layer: int) -> Dict[int, Path]:
+        """Find the per-model-layer probes of a multi-layer lens, keyed by model layer."""
+        probes = {}
+        for path in (self.lenses_dir / f"layer{layer}").glob(f"{sumo_term}@L*.pt"):
+            term, model_layer = parse_probe_filename(path.stem)
+            if term == sumo_term and model_layer is not None:
+                probes[model_layer] = path
+        return probes
 
     def _find_text_lens_path(self, sumo_term: str, layer: int) -> Optional[Path]:
         """Find text lens path for a concept."""

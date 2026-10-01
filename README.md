@@ -66,8 +66,12 @@ for step in monitor.generate("Some prompt", max_new_tokens=64):
         print("  ", " → ".join(alert.path), alert.score)
 ```
 
+For an instruct model, `monitor.generate(prompt, chat=True)` (or
+`headspace run --chat`) sends the prompt through the tokenizer's chat template.
+
 To monitor a model you run yourself, pass hidden states straight to
-`monitor.read(hidden_state)`.
+`monitor.read(...)`: one hidden state, or a dict of model layer to hidden state
+covering `monitor.required_model_layers` for packs with multi-layer lenses.
 
 ## Watch profiles
 
@@ -89,8 +93,25 @@ A lens pack is trained for one specific model. Its layout:
     hierarchy.json
     layer0.json ... layer6.json
   layer0/<Concept>.pt ...     one lens per concept, by ontology layer
+  layer1/<Concept>@L19.pt ... or one probe per model layer (see below)
   simplex/                    optional always-on dimensional lenses
 ```
+
+A lens can read a concept from several depths of the model. Give it one probe
+file per model layer, `<Concept>@L<model_layer>.pt`, and the lens combines them
+into a single score for the hierarchy, while each detection still reports the
+score from each layer. Plain `<Concept>.pt` lenses read the pack's
+`model_layer` from `pack_info.json`.
+
+Probes at different depths can pick up different senses of a concept, so a
+lens should fire when any one of them stands out. Raw probe scores aren't
+comparable across layers, though. A pack can calibrate each probe on its own
+background: `probe_calibration.json` holds each probe's score quantiles on
+text it wasn't trained on, measured on single-token hidden states as HAT
+reads them. With it, each probe score becomes the fraction of its background
+it exceeds, and a lens is the max of its probes. Without it, a lens is the
+mean of its raw probes. On calibrated packs the default alert threshold is
+0.99, meaning above 99% of background; on raw packs it is 0.5.
 
 Older packs don't bundle their hierarchy. Pass `--hierarchy`, or bundle it once:
 

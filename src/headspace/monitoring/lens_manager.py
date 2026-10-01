@@ -36,6 +36,7 @@ import torch.nn as nn
 
 # Import modular components
 from .lens_types import (
+    Lens,
     LensRole,
     SimpleMLP,
     SimplexBinding,
@@ -254,6 +255,14 @@ class DynamicLensManager:
             self.manifest = manifest
             print(f"✓ Using manifest: {self.manifest.manifest_id}")
 
+        # Model layer that single-probe lenses read, if the pack declares one.
+        # Multi-layer lenses name their own layers per probe.
+        self.model_layer: Optional[int] = None
+        pack_info_path = self.lenses_dir / "pack_info.json"
+        if pack_info_path.exists():
+            with open(pack_info_path) as f:
+                self.model_layer = json.load(f).get("model_layer")
+
         # Try to load calibration data from lens pack
         calibration_path = self.lenses_dir / "calibration.json"
         if calibration_path.exists():
@@ -298,6 +307,8 @@ class DynamicLensManager:
             use_activation_lenses=use_activation_lenses,
             use_text_lenses=use_text_lenses,
         )
+        # Calibrated multi-layer lenses score as percentiles of background, not raw probabilities
+        self.probe_calibrated = bool(self.loader.probe_calibration)
 
         # === LOAD BASE LAYERS ===
         print(f"\nInitializing DynamicLensManager...")
@@ -577,6 +588,38 @@ class DynamicLensManager:
         self.cache.mark_lens_bank_dirty()
         return loaded
 
+    @property
+    def required_model_layers(self) -> List[int]:
+        """Model layers read by the pack's multi-layer lenses."""
+        layers = set()
+        for metadata in self.concept_metadata.values():
+            layers.update(metadata.probe_paths)
+        return sorted(layers)
+
+    def get_probe_scores(self, concept_name: str, layer: int) -> Dict[int, float]:
+        """Per-model-layer scores from a multi-layer lens's last reading; empty otherwise."""
+        lens = self.cache.loaded_lenses.get((concept_name, layer))
+        return dict(lens.last_probe_scores) if isinstance(lens, Lens) else {}
+
+    def _normalize(self, hidden_state: torch.Tensor) -> torch.Tensor:
+        if hidden_state.dim() == 1:
+            hidden_state = hidden_state.unsqueeze(0)
+        if self.normalize_hidden_states:
+            hidden_dim = hidden_state.shape[-1]
+            if self._layer_norm is None or self._layer_norm.normalized_shape[0] != hidden_dim:
+                self._layer_norm = nn.LayerNorm(hidden_dim, elementwise_affine=False).to(hidden_state.device)
+            hidden_state = self._layer_norm(hidden_state)
+        return hidden_state.to(self.device)
+
+    @staticmethod
+    def _score_lens(lens, hidden_state, layer_states, return_logits):
+        """Run one lens on its input: the default hidden state, or its model layers."""
+        x = layer_states if isinstance(lens, Lens) else hidden_state
+        if return_logits:
+            prob, logit = lens(x, return_logits=True)
+            return prob.item(), logit.item()
+        return lens(x).item(), None
+
     def detect_and_expand(
         self,
         hidden_state: torch.Tensor,
@@ -586,12 +629,16 @@ class DynamicLensManager:
         skip_pruning: bool = False,
         max_expansion_depth: int = None,
         use_calibration: bool = True,
+        layer_states: Optional[Dict[int, torch.Tensor]] = None,
     ) -> Tuple[List[Tuple[str, float, int]], Optional[Dict]]:
         """
         Detect concepts in hidden state, dynamically loading children as needed.
 
         Args:
-            hidden_state: Hidden state tensor [1, hidden_dim] or [hidden_dim]
+            hidden_state: Hidden state tensor [1, hidden_dim] or [hidden_dim],
+                read by single-probe lenses
+            layer_states: model_layer -> hidden state, read by multi-layer lenses
+                (see `required_model_layers`)
             top_k: Return top K concepts
             return_timing: Return detailed timing breakdown
             return_logits: If True, return (concept_name, probability, logit, layer) tuples
@@ -609,17 +656,9 @@ class DynamicLensManager:
         timing = {} if return_timing else None
         start = time.time()
 
-        if hidden_state.dim() == 1:
-            hidden_state = hidden_state.unsqueeze(0)
-
-        # Normalize hidden states
-        if self.normalize_hidden_states:
-            hidden_dim = hidden_state.shape[-1]
-            if self._layer_norm is None or self._layer_norm.normalized_shape[0] != hidden_dim:
-                self._layer_norm = nn.LayerNorm(hidden_dim, elementwise_affine=False).to(hidden_state.device)
-            hidden_state = self._layer_norm(hidden_state)
-
-        hidden_state = hidden_state.to(self.device)
+        hidden_state = self._normalize(hidden_state)
+        if layer_states is not None:
+            layer_states = {layer: self._normalize(h) for layer, h in layer_states.items()}
 
         # Match dtype to lens dtype
         if self.cache.loaded_lenses:
@@ -627,6 +666,8 @@ class DynamicLensManager:
             lens_dtype = next(sample_lens.parameters()).dtype
             if hidden_state.dtype != lens_dtype:
                 hidden_state = hidden_state.to(dtype=lens_dtype)
+            if layer_states is not None:
+                layer_states = {layer: h.to(dtype=lens_dtype) for layer, h in layer_states.items()}
 
         # 1. Run all currently loaded lenses
         t1 = time.time()
@@ -646,18 +687,18 @@ class DynamicLensManager:
                 for concept_key in current_scores:
                     self.cache.lens_scores[concept_key] = current_scores[concept_key]
                     self.cache.lens_access_count[concept_key] += 1
-            else:
-                for concept_key, lens in self.cache.loaded_lenses.items():
-                    if return_logits:
-                        prob, logit = lens(hidden_state, return_logits=True)
-                        prob = prob.item()
-                        logit = logit.item()
-                        current_logits[concept_key] = logit
-                    else:
-                        prob = lens(hidden_state).item()
-                    current_scores[concept_key] = prob
-                    self.cache.lens_scores[concept_key] = prob
-                    self.cache.lens_access_count[concept_key] += 1
+
+            # Lenses the bank didn't score: multi-layer Lenses, or all of them
+            # when there is no compiled bank
+            for concept_key, lens in self.cache.loaded_lenses.items():
+                if concept_key in current_scores:
+                    continue
+                prob, logit = self._score_lens(lens, hidden_state, layer_states, return_logits)
+                if return_logits:
+                    current_logits[concept_key] = logit
+                current_scores[concept_key] = prob
+                self.cache.lens_scores[concept_key] = prob
+                self.cache.lens_access_count[concept_key] += 1
 
         if timing is not None:
             timing['initial_detection'] = (time.time() - t1) * 1000
@@ -730,13 +771,9 @@ class DynamicLensManager:
                         for concept_key in child_keys_to_load:
                             if concept_key in self.cache.loaded_lenses:
                                 lens = self.cache.loaded_lenses[concept_key]
+                                prob, logit = self._score_lens(lens, hidden_state, layer_states, return_logits)
                                 if return_logits:
-                                    prob, logit = lens(hidden_state, return_logits=True)
-                                    prob = prob.item()
-                                    logit = logit.item()
                                     current_logits[concept_key] = logit
-                                else:
-                                    prob = lens(hidden_state).item()
                                 current_scores[concept_key] = prob
                                 self.cache.lens_scores[concept_key] = prob
                                 self.cache.lens_access_count[concept_key] += 1

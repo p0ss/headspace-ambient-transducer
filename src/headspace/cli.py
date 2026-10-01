@@ -10,6 +10,13 @@ import sys
 from pathlib import Path
 
 
+def _probes(detection) -> str:
+    """Per-model-layer scores of a multi-layer lens, e.g. ' [L7 .12 L19 .91 L30 .64]'."""
+    if not detection.probes:
+        return ""
+    return " [" + " ".join(f"L{layer} {score:.2f}" for layer, score in sorted(detection.probes.items())) + "]"
+
+
 def _cmd_run(args) -> int:
     from .runtime import Monitor, WatchProfile
 
@@ -29,7 +36,7 @@ def _cmd_run(args) -> int:
 
     print(f"\n{args.prompt}", end="", flush=True)
     steps = []
-    for step in monitor.generate(args.prompt, max_new_tokens=args.max_new_tokens):
+    for step in monitor.generate(args.prompt, max_new_tokens=args.max_new_tokens, chat=args.chat):
         steps.append(step)
         print(step.token, end="", flush=True)
     print("\n")
@@ -40,10 +47,10 @@ def _cmd_run(args) -> int:
         line = f"{flag} {step.index:3d} {step.token!r:>14}  "
         line += f"[{step.loaded_lenses:4d}/{step.total_lenses} lenses {step.lens_memory_mb:6.1f}MB {step.monitor_ms:5.1f}ms]  "
         if top:
-            line += " → ".join(top.path) + f" ({top.score:.2f})"
+            line += " → ".join(top.path) + f" ({top.score:.2f}){_probes(top)}"
         print(line)
         for alert in step.alerts:
-            print(f"      ALERT {' → '.join(alert.path)} ({alert.score:.2f})")
+            print(f"      ALERT {' → '.join(alert.path)} ({alert.score:.2f}){_probes(alert)}")
 
     peak = max(steps, key=lambda s: s.loaded_lenses) if steps else None
     if peak:
@@ -73,11 +80,13 @@ def main(argv=None) -> int:
     run.add_argument("--pack", required=True, type=Path)
     run.add_argument("--hierarchy", type=Path, help="Concept hierarchy dir, if the pack has none")
     run.add_argument("--watch", type=Path, help="File of concept names to alert on, one per line")
-    run.add_argument("--threshold", type=float, default=0.5)
+    run.add_argument("--threshold", type=float, default=None,
+                     help="Alert threshold (default 0.99 for probe-calibrated packs, else 0.5)")
     run.add_argument("--device", default="cuda")
     run.add_argument("--max-new-tokens", type=int, default=48)
     run.add_argument("--max-loaded", type=int, default=1000)
     run.add_argument("--top-k", type=int, default=10)
+    run.add_argument("--chat", action="store_true", help="Send the prompt through the chat template (instruct models)")
     run.set_defaults(func=_cmd_run)
 
     pack = sub.add_parser("pack", help="Lens pack utilities")

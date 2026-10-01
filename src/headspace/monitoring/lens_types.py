@@ -14,7 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 
 import torch
 import torch.nn as nn
@@ -102,6 +102,85 @@ def create_lens_from_state_dict(state_dict: dict, hidden_dim: int, device: str) 
     return lens
 
 
+class Lens(nn.Module):
+    """
+    One concept read from several model layers.
+
+    Each probe reads the hidden state of its own model layer; the lens combines
+    them into the single score the hierarchy runs on. Per-probe scores from the
+    last forward pass are kept in `last_probe_scores` so callers can see where
+    in depth the concept showed up.
+
+    With per-probe calibration (quantiles of each probe's scores on background
+    text, from the lens pack's probe_calibration.json), every probe score becomes
+    the fraction of background it exceeds, and the lens is the max of those: it
+    fires when any layer's evidence stands out against that layer's own
+    background. Without calibration, raw probe scores aren't comparable across
+    layers, so the lens takes their mean.
+
+    The input is a dict of model_layer -> hidden state [1, hidden_dim], already
+    normalised the same way as single-layer lenses.
+    """
+
+    has_layer_norm = False
+
+    def __init__(self, probes: Dict[int, nn.Module], calibration: Optional[Dict[int, torch.Tensor]] = None):
+        super().__init__()
+        self.model_layers = sorted(probes)
+        self.probes = nn.ModuleDict({str(layer): probes[layer] for layer in self.model_layers})
+        self.calibrated = bool(calibration) and all(layer in calibration for layer in self.model_layers)
+        if self.calibrated:
+            for layer in self.model_layers:
+                self.register_buffer(f"quantiles_{layer}", calibration[layer].float())
+        self.last_probe_scores: Dict[int, float] = {}
+
+    def _percentile(self, prob: torch.Tensor, layer: int) -> torch.Tensor:
+        """Fraction of this probe's background that scored below `prob` (linear between quantiles)."""
+        q = getattr(self, f"quantiles_{layer}").to(prob.device)
+        k = q.numel()
+        idx = torch.searchsorted(q, prob.float().contiguous()).clamp(1, k - 1)
+        lo, hi = q[idx - 1], q[idx]
+        frac = torch.where(hi > lo, (prob.float() - lo) / (hi - lo), torch.zeros_like(lo)).clamp(0, 1)
+        pct = (idx - 1 + frac) / (k - 1)
+        return torch.where(prob.float() <= q[0], torch.zeros_like(pct), torch.where(prob.float() >= q[-1], torch.ones_like(pct), pct))
+
+    def forward(self, layer_states: Dict[int, torch.Tensor], return_logits: bool = False):
+        if not isinstance(layer_states, dict):
+            raise TypeError(
+                f"Lens reads model layers {self.model_layers}; pass layer_states "
+                f"(model_layer -> hidden state) to the lens manager"
+            )
+        scores = []
+        for layer in self.model_layers:
+            prob = self.probes[str(layer)](layer_states[layer])
+            scores.append(self._percentile(prob, layer) if self.calibrated else prob.float())
+        scores = torch.stack(scores)
+        self.last_probe_scores = {
+            layer: float(s) for layer, s in zip(self.model_layers, scores.reshape(len(scores), -1)[:, 0])
+        }
+
+        prob = scores.max(dim=0).values if self.calibrated else scores.mean(dim=0)
+        if return_logits:
+            return prob, torch.logit(prob.clamp(1e-6, 1 - 1e-6))
+        return prob
+
+
+def parse_probe_filename(stem: str) -> Tuple[str, Optional[int]]:
+    """
+    Split a lens file stem into (concept, model_layer).
+
+    `Economics@L19` reads model layer 19. `Economics` and
+    `Economics_classifier` carry no model layer and read the pack default.
+    """
+    if "@L" in stem:
+        term, _, layer = stem.rpartition("@L")
+        if layer.isdigit():
+            return term, int(layer)
+    if stem.endswith("_classifier"):
+        stem = stem[: -len("_classifier")]
+    return stem, None
+
+
 @dataclass
 class SimplexBinding:
     """Configuration for a simplex bound to a concept."""
@@ -166,6 +245,10 @@ class ConceptMetadata:
     # Falls back to activation_lens_path if polar_lenses is empty (backward compat)
     polar_lenses: Dict[str, Path] = field(default_factory=dict)
 
+    # Multi-layer lens support - one probe per model layer, keyed by model layer.
+    # Empty for single-probe lenses, which read the pack's default model layer.
+    probe_paths: Dict[int, Path] = field(default_factory=dict)
+
     @property
     def has_polar_lenses(self) -> bool:
         """True if concept has multiple polarity probes."""
@@ -186,6 +269,8 @@ __all__ = [
     "LensRole",
     "LensPolarity",
     "SimpleMLP",
+    "Lens",
+    "parse_probe_filename",
     "SimplexBinding",
     "ConceptMetadata",
     "detect_layer_norm",

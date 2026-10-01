@@ -33,6 +33,11 @@ CONCEPT_FIELDS = (
     "sumo_depth",
     "sumo_definition",
     "definition",
+    "related_concepts",
+    "equivalent_concepts",
+    "label",
+    "topic_description",
+    "definition_only",
 )
 
 

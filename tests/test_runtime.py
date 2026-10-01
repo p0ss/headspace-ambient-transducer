@@ -100,3 +100,153 @@ def test_watch_profile_covers_branch(pack):
     assert "Deception" in alerted
     assert "Object" not in alerted
     assert monitor.lens_memory_mb() > 0
+
+
+# --- Multi-layer lenses -----------------------------------------------------
+#
+# Deception gets one probe per model layer. Each probe fires on +e0 and stays
+# quiet on -e0, so feeding different hidden states per layer shows which layer
+# each probe actually read.
+
+PROBE_LAYERS = (3, 7)
+
+
+def _save_direction_probe(path: Path):
+    lens = SimpleMLP(HIDDEN)
+    with torch.no_grad():
+        for p in lens.parameters():
+            p.zero_()
+        lens.net[0].weight[0, 0] = 1.0
+        lens.net[3].weight[0, 0] = 1.0
+        lens.net[6].weight[0, 0] = 20.0
+        lens.net[6].bias.fill_(-10.0)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(lens.state_dict(), path)
+
+
+def _state(sign: float) -> torch.Tensor:
+    h = torch.zeros(HIDDEN)
+    h[0] = sign
+    return h
+
+
+@pytest.fixture
+def multi_layer_pack(tmp_path, concept_hierarchy):
+    pack = tmp_path / "multi"
+    for name, (layer, _, fires) in CONCEPTS.items():
+        if name == "Deception":
+            for model_layer in PROBE_LAYERS:
+                _save_direction_probe(pack / f"layer{layer}" / f"{name}@L{model_layer}.pt")
+        else:
+            _save_lens(pack / f"layer{layer}" / f"{name}.pt", fires)
+    (pack / "pack_info.json").write_text(json.dumps({"source_pack": "synthetic", "model_layer": 5}))
+    add_hierarchy(pack, concept_hierarchy)
+    return pack
+
+
+def _deception(detections):
+    return next(d for d in detections if d.concept == "Deception")
+
+
+def test_parse_probe_filename():
+    from headspace.monitoring.lens_types import parse_probe_filename
+    assert parse_probe_filename("Economics@L19") == ("Economics", 19)
+    assert parse_probe_filename("Economics") == ("Economics", None)
+    assert parse_probe_filename("Economics_classifier") == ("Economics", None)
+    assert parse_probe_filename("Odd@Lname") == ("Odd@Lname", None)
+
+
+def test_multi_layer_lens_reads_each_probe_from_its_own_layer(multi_layer_pack):
+    manager = DynamicLensManager(lenses_dir=multi_layer_pack, device="cpu", base_layers=[0])
+    monitor = Monitor(model=None, tokenizer=None, lens_manager=manager)
+    assert monitor.hidden_layer == 5
+    assert monitor.required_model_layers == list(PROBE_LAYERS)
+
+    def read(l3, l7):
+        states = {5: torch.randn(HIDDEN), 3: _state(l3), 7: _state(l7)}
+        for _ in range(3):
+            detections, _ = monitor.read(states)
+        return _deception(detections)
+
+    early = read(+1, -1)
+    assert early.probes[3] > 0.9 and early.probes[7] < 0.1
+    # uncalibrated probes aren't comparable across layers, so the lens takes their mean
+    assert early.score == pytest.approx(sum(early.probes.values()) / 2, abs=1e-3)
+
+    late = read(-1, +1)
+    assert late.probes[3] < 0.1 and late.probes[7] > 0.9
+
+    manager.detect_and_expand(torch.randn(HIDDEN), layer_states={3: _state(-1), 7: _state(-1)})
+    raw = manager.cache.lens_scores[("Deception", 2)]
+    assert raw < 0.1
+
+
+def test_multi_layer_lenses_stay_out_of_bank_and_tepid_cache(multi_layer_pack):
+    from headspace.monitoring.lens_types import Lens
+    manager = DynamicLensManager(lenses_dir=multi_layer_pack, device="cpu", base_layers=[0])
+    manager.preload_pack_to_ram()
+    assert ("Deception", 2) not in manager.cache.tepid_cache
+
+    states = {3: _state(1), 7: _state(1)}
+    for _ in range(3):
+        manager.detect_and_expand(torch.randn(HIDDEN), layer_states=states)
+    assert isinstance(manager.cache.loaded_lenses[("Deception", 2)], Lens)
+    assert ("Deception", 2) not in manager.cache.get_lens_bank().concept_keys
+
+
+def test_generate_feeds_model_layers_to_lenses(multi_layer_pack):
+    from transformers import LlamaConfig, LlamaForCausalLM
+
+    config = LlamaConfig(vocab_size=32, hidden_size=HIDDEN, intermediate_size=32,
+                         num_hidden_layers=8, num_attention_heads=2, num_key_value_heads=2)
+    model = LlamaForCausalLM(config).eval()
+
+    class Tokenizer:
+        eos_token_id = None
+
+        def __call__(self, text, return_tensors=None):
+            return type("Enc", (), {"input_ids": torch.tensor([[1, 2, 3]])})()
+
+        def decode(self, ids):
+            return f"<{int(ids[0])}>"
+
+    manager = DynamicLensManager(lenses_dir=multi_layer_pack, device="cpu", base_layers=[0])
+    monitor = Monitor(model, Tokenizer(), manager)
+
+    seen = []
+    original = manager.detect_and_expand
+
+    def spy(hidden_state, **kwargs):
+        seen.append(set(kwargs["layer_states"]))
+        return original(hidden_state, **kwargs)
+
+    manager.detect_and_expand = spy
+    steps = list(monitor.generate("prompt", max_new_tokens=4))
+
+    assert len(steps) == 4
+    assert all(layers == {3, 5, 7} for layers in seen)
+    assert any(d.probes for s in steps for d in s.detections if d.concept == "Deception")
+
+
+def test_calibrated_lens_is_max_of_probe_percentiles(multi_layer_pack):
+    # Background quantiles: each probe's raw scores on unrelated text sit near 0,
+    # so a probe firing at ~1 exceeds all of its background
+    quantiles = [0.0, 0.001, 0.01, 0.05, 0.2]
+    calibration = {"method": "percentile", "probes": {
+        f"layer2/Deception@L{layer}": {"model_layer": layer, "quantiles": quantiles} for layer in PROBE_LAYERS}}
+    (multi_layer_pack / "probe_calibration.json").write_text(json.dumps(calibration))
+
+    manager = DynamicLensManager(lenses_dir=multi_layer_pack, device="cpu", base_layers=[0])
+    monitor = Monitor(model=None, tokenizer=None, lens_manager=manager,
+                      watch=WatchProfile(["Agent"]))
+    assert manager.probe_calibrated
+    assert monitor.watch.threshold == 0.99  # "above 99% of background" for calibrated packs
+
+    states = {5: torch.randn(HIDDEN), 3: _state(+1), 7: _state(-1)}
+    for _ in range(3):
+        detections, _ = monitor.read(states)
+    d = _deception(detections)
+    assert d.probes[3] == pytest.approx(1.0)       # fires above all of its background
+    assert d.probes[7] < 0.3                        # ~0 raw sits inside its background
+    assert d.score == pytest.approx(1.0, abs=1e-3)  # max of calibrated probes
+    assert monitor.watch.matches(d)
