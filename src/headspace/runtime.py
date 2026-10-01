@@ -215,21 +215,23 @@ class Monitor:
     @torch.inference_mode()
     def generate(
         self,
-        prompt: str,
+        prompt: Union[str, List[Dict[str, str]]],
         max_new_tokens: int = 64,
         temperature: float = 0.0,
         chat: bool = False,
     ) -> Iterator[Step]:
         """Generate from `prompt`, yielding a monitoring Step per new token.
 
-        chat: send the prompt as a user turn through the tokenizer's chat template
-        (for instruct models) instead of as raw text to continue.
+        prompt: text, or a list of chat messages ({"role", "content"}), which
+            always goes through the chat template.
+        chat: send a text prompt as a user turn through the tokenizer's chat
+            template (for instruct models) instead of as raw text to continue.
         """
         device = self.model.device
-        if chat:
+        messages = prompt if isinstance(prompt, list) else ([{"role": "user", "content": prompt}] if chat else None)
+        if messages is not None:
             input_ids = self.tokenizer.apply_chat_template(
-                [{"role": "user", "content": prompt}], add_generation_prompt=True, return_tensors="pt",
-                return_dict=True,
+                messages, add_generation_prompt=True, return_tensors="pt", return_dict=True,
             )["input_ids"].to(device)
         else:
             input_ids = self.tokenizer(prompt, return_tensors="pt").input_ids.to(device)

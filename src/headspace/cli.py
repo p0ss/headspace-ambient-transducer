@@ -1,6 +1,7 @@
 """
 headspace run    --model google/gemma-3-4b-pt --pack path/to/pack "prompt"
 headspace trace  --model google/gemma-4-E4B-it --pack path/to/pack --prompts prompts.json --output trace.json
+headspace serve  --model google/gemma-4-E4B-it --pack path/to/pack --port 8765
 headspace pack add-hierarchy path/to/pack path/to/concept_pack/hierarchy
 """
 
@@ -77,6 +78,16 @@ def _cmd_trace(args) -> int:
     return 0
 
 
+def _cmd_serve(args) -> int:
+    try:
+        from .server import serve
+    except ImportError as exc:
+        raise SystemExit(f"headspace serve needs the serve extra: pip install 'headspace-ambient-transducer[serve]' ({exc})")
+    serve(args.model, args.pack, host=args.host, port=args.port, device=args.device,
+          watch=args.watch, max_loaded=args.max_loaded)
+    return 0
+
+
 def _cmd_add_hierarchy(args) -> int:
     from .pack import add_hierarchy
 
@@ -117,6 +128,16 @@ def main(argv=None) -> int:
     trace.add_argument("--device", default="cuda")
     trace.add_argument("--max-loaded", type=int, default=1000)
     trace.set_defaults(func=_cmd_trace)
+
+    srv = sub.add_parser("serve", help="Serve an OpenAI-compatible chat API that streams concept readings, plus a live viewer")
+    srv.add_argument("--model", required=True)
+    srv.add_argument("--pack", required=True, type=Path)
+    srv.add_argument("--host", default="127.0.0.1")
+    srv.add_argument("--port", type=int, default=8765)
+    srv.add_argument("--device", default="cuda")
+    srv.add_argument("--watch", type=Path, help="Watch profile: concepts that set safety_intensity / alerts")
+    srv.add_argument("--max-loaded", type=int, default=1000)
+    srv.set_defaults(func=_cmd_serve)
 
     pack = sub.add_parser("pack", help="Lens pack utilities")
     pack_sub = pack.add_subparsers(dest="pack_command", required=True)

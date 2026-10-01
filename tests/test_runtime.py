@@ -200,6 +200,7 @@ def test_generate_feeds_model_layers_to_lenses(multi_layer_pack):
     config = LlamaConfig(vocab_size=32, hidden_size=HIDDEN, intermediate_size=32,
                          num_hidden_layers=8, num_attention_heads=2, num_key_value_heads=2)
     model = LlamaForCausalLM(config).eval()
+    model.generation_config.eos_token_id = None  # a random model mustn't stop early on a default EOS id
 
     class Tokenizer:
         eos_token_id = None
@@ -259,6 +260,7 @@ def test_trace_records_tokens_fields_and_concepts(multi_layer_pack):
     config = LlamaConfig(vocab_size=32, hidden_size=HIDDEN, intermediate_size=32,
                          num_hidden_layers=8, num_attention_heads=2, num_key_value_heads=2)
     model = LlamaForCausalLM(config).eval()
+    model.generation_config.eos_token_id = None  # a random model mustn't stop early on a default EOS id
 
     class Tokenizer:
         eos_token_id = None
@@ -280,3 +282,48 @@ def test_trace_records_tokens_fields_and_concepts(multi_layer_pack):
     token = run["tokens"][0]
     assert len(token["fields"]) == 1 and token["top"]
     assert all(set(row[2]) <= {"3", "7"} for row in token["top"])  # per-layer scores keyed by model layer
+
+
+def test_server_streams_tokens_with_concept_metadata(multi_layer_pack):
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+    from transformers import LlamaConfig, LlamaForCausalLM
+    from headspace.server import create_app
+
+    config = LlamaConfig(vocab_size=32, hidden_size=HIDDEN, intermediate_size=32,
+                         num_hidden_layers=8, num_attention_heads=2, num_key_value_heads=2)
+    model = LlamaForCausalLM(config).eval()
+    model.generation_config.eos_token_id = None
+
+    class Tokenizer:
+        eos_token_id = None
+
+        def apply_chat_template(self, messages, **kwargs):
+            return {"input_ids": torch.tensor([[1, 2, 3]])}
+
+        def decode(self, ids):
+            return f"<{int(ids[0])}>"
+
+    manager = DynamicLensManager(lenses_dir=multi_layer_pack, device="cpu", base_layers=[0])
+    client = TestClient(create_app(Monitor(model, Tokenizer(), manager), multi_layer_pack, "tiny-llama"))
+
+    assert client.get("/v1/models").json()["data"][0]["id"] == "hat/multi"
+    pack = client.get("/v1/pack").json()
+    assert pack["fields"] == ["Root"] and pack["concepts"]["Deception"]["parent"] == "Agent"
+    assert "What the model is thinking about" in client.get("/").text
+
+    body = {"messages": [{"role": "user", "content": "hi"}], "stream": True, "max_tokens": 3}
+    with client.stream("POST", "/v1/chat/completions", json=body) as res:
+        lines = [l for l in res.iter_lines() if l.startswith("data: ")]
+    assert lines[-1] == "data: [DONE]"
+    chunks = [json.loads(l[6:]) for l in lines[:-1]]
+    tokens = [c for c in chunks if "metadata" in c["choices"][0]["delta"]]
+    assert len(tokens) == 3
+    meta = tokens[0]["choices"][0]["delta"]["metadata"]
+    assert set(meta) == {"divergence", "hat"}
+    assert meta["divergence"]["top_divergences"] and "safety_intensity" in meta["divergence"]
+    assert set(meta["hat"]["fields"]) == {"Root"} and meta["hat"]["detections"][0]["path"]
+    assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
+
+    full = client.post("/v1/chat/completions", json={**body, "stream": False}).json()
+    assert len(full["token_metadata"]) == 3 and full["choices"][0]["message"]["content"]
