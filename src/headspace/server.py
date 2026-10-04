@@ -164,14 +164,14 @@ def create_app(monitor: Monitor, pack_dir: Path, model_name: str):
 
 
 def serve(model: str, pack: Path, host: str = "127.0.0.1", port: int = 8765, device: str = "cuda",
-          watch: Optional[Path] = None, max_loaded: int = 1000):
+          watch: Optional[Path] = None, max_loaded: Optional[int] = None, ram_mb: Optional[int] = 8192):
     import uvicorn
 
     from .pack import resolve_pack
     from .runtime import WatchProfile
 
     pack = resolve_pack(pack)
-    monitor = Monitor.from_pretrained(model, pack, device=device, max_loaded_lenses=max_loaded,
+    monitor = Monitor.from_pretrained(model, pack, device=device, max_loaded_lenses=max_loaded, ram_mb=ram_mb,
                                       watch=WatchProfile.from_file(watch) if watch else None)
     monitor.top_k = 10
     uvicorn.run(create_app(monitor, pack, model), host=host, port=port)

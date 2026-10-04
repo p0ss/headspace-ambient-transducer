@@ -84,22 +84,39 @@ every concept it is only checked when its parent fires. Profiles can live in
 a text file, one concept per line (`WatchProfile.from_file`, or
 `headspace run --watch`).
 
-## What it costs
+## Speed, memory and how to tune them
 
-Monitoring time per token on an RTX 3090 (`demo/bench_monitor.py`):
+Monitoring trades speed against GPU memory, and you choose the balance. The
+whole pack sits in CPU RAM. Each token, HAT scores the lenses that are
+active, loads the children of the concepts that fire, and keeps recently
+used lenses on the GPU (the warm tier) so it doesn't have to copy them in
+again. A bigger warm tier is faster and uses more VRAM; a smaller one is
+slower and uses less. The right setting depends on how many concepts you
+monitor, how fast replies need to be, and how much VRAM you can spare.
 
-| Model and pack | Concepts | Loaded at once | Monitoring per token, median (mean) |
-|---|---|---|---|
-| Gemma 4 E4B-it, university pack | 178 | about 22 | 5.3 ms (7.4) |
-| Gemma 3 4B, First Light | 7,947 | about 37 | 11.2 ms (21.6) |
+Measured on an RTX 3090 (`demo/bench_monitor.py`):
 
-With the university pack, a whole token takes about 31.6 ms against 26.5 ms
-with no monitoring: about 19% more. A pack 45 times broader costs about twice
-as much monitoring, because only the active branches are scored. The whole
-pack is held in CPU RAM (8 GB by default), so loading a branch is a copy
-rather than a read from disk, and recently used lenses stay on the GPU for
-reuse: about 0.7 GB for the university pack and up to 3.5 GB for First Light
-at its default settings, against 10.7 GB for every First Light lens.
+| Model and pack | Concepts | Warm tier | GPU memory for lenses (peak) | Monitoring per token, median (90th pct) |
+|---|---|---|---|---|
+| Gemma 4 E4B-it, university pack | 178 | 1,000 lenses (whole pack) | 1.3 GB | 5.3 ms (6.4) |
+| Gemma 3 4B, First Light | 7,947 | 2,000 lenses (pack default) | 3.5 GB | 10.6 ms (34) |
+| Gemma 3 4B, First Light | 7,947 | 500 lenses | 2.0 GB | 94 ms (232) |
+| Gemma 3 4B, First Light | 7,947 | 150 lenses | 1.8 GB | 133 ms (323) |
+
+For scale: every First Light lens on the GPU would take 10.7 GB, and a
+token of Gemma 3 4B takes about 19 ms to generate. With the university pack
+a whole token takes 31.6 ms against 26.5 ms with no monitoring.
+
+The settings:
+
+- `max_loaded_lenses` (`Monitor.from_pretrained`, `--max-loaded`): lenses
+  kept on the GPU, active plus warm. The main dial between speed and VRAM.
+- `ram_mb` (`Monitor.from_pretrained`, `--ram-mb`): how much of the pack to hold in CPU RAM (8 GB by
+  default). Lenses that don't fit are read from disk when needed, which is
+  slower.
+- `top_k` (`monitor.top_k`, `headspace run --top-k`): how many of the highest-scoring concepts are expanded
+  into their children each token. Fewer means fewer lenses loaded per token,
+  but a narrower look beneath the surface.
 
 ## How a lens works
 

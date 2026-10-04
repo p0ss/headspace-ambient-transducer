@@ -120,7 +120,7 @@ class Monitor:
         device: str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
         watch: Optional[WatchProfile] = None,
-        max_loaded_lenses: int = 1000,
+        max_loaded_lenses: Optional[int] = None,
         ram_mb: Optional[int] = 8192,
         **manager_kwargs,
     ) -> "Monitor":
@@ -128,6 +128,9 @@ class Monitor:
 
         pack_dir: a lens pack directory, or a Hugging Face repo id such as
             "HatCatFTW/gemma-4-e4b-it_university-v3.1-bands" (downloaded once, then cached).
+        max_loaded_lenses: most lenses kept on the device, active plus warm
+            (recently used, kept for reuse). Larger is faster and uses more
+            VRAM. Overrides a pack's own setting; default 1000, or the pack's.
         ram_mb: preload up to this much of the pack into CPU RAM (in its on-disk
             dtype), so lenses the cascade loads are copied to the device instead
             of read from disk. 0 turns it off; None preloads the whole pack.
@@ -155,7 +158,7 @@ class Monitor:
             base_layers=[0],
             load_threshold=0.3,
             keep_top_k=100,
-            max_loaded_lenses=max_loaded_lenses,
+            max_loaded_lenses=max_loaded_lenses or 1000,
         )
         if hierarchy_dir is not None:
             kwargs["layers_data_dir"] = Path(hierarchy_dir)
@@ -163,6 +166,8 @@ class Monitor:
         manager = DynamicLensManager(**kwargs)
         if not manager.concept_metadata:
             raise RuntimeError(f"No concepts with lenses found in {pack_dir}")
+        if max_loaded_lenses is not None:  # an explicit setting wins over the pack's manifest
+            manager.cache.max_loaded_lenses = max_loaded_lenses
         if ram_mb != 0:
             manager.preload_pack_to_ram(max_ram_mb=ram_mb)
 

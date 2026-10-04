@@ -33,6 +33,7 @@ def _cmd_run(args) -> int:
         device=args.device,
         watch=watch,
         max_loaded_lenses=args.max_loaded,
+        ram_mb=args.ram_mb,
     )
     monitor.top_k = args.top_k
 
@@ -70,7 +71,8 @@ def _cmd_trace(args) -> int:
     from .pack import resolve_pack
     from .trace import load_prompts, record
 
-    monitor = Monitor.from_pretrained(args.model, args.pack, device=args.device, max_loaded_lenses=args.max_loaded)
+    monitor = Monitor.from_pretrained(args.model, args.pack, device=args.device, max_loaded_lenses=args.max_loaded,
+                                      ram_mb=args.ram_mb)
     monitor.top_k = max(args.top, 10)
     trace = record(monitor, resolve_pack(args.pack), load_prompts(args.prompts), max_new_tokens=args.max_new_tokens,
                    top=args.top, chat=not args.raw, model_name=args.model)
@@ -85,7 +87,7 @@ def _cmd_serve(args) -> int:
     except ImportError as exc:
         raise SystemExit(f"headspace serve needs the serve extra: pip install 'headspace-ambient-transducer[serve]' ({exc})")
     serve(args.model, args.pack, host=args.host, port=args.port, device=args.device,
-          watch=args.watch, max_loaded=args.max_loaded)
+          watch=args.watch, max_loaded=args.max_loaded, ram_mb=args.ram_mb)
     return 0
 
 
@@ -112,7 +114,8 @@ def main(argv=None) -> int:
                      help="Alert threshold (default 0.99 for probe-calibrated packs, else 0.5)")
     run.add_argument("--device", default="cuda")
     run.add_argument("--max-new-tokens", type=int, default=48)
-    run.add_argument("--max-loaded", type=int, default=1000)
+    run.add_argument("--max-loaded", type=int, default=None, help="Most lenses kept on the GPU, active plus warm (default 1000, or the pack's)")
+    run.add_argument("--ram-mb", type=int, default=8192, help="Lens pack held in CPU RAM, MB (0: read from disk)")
     run.add_argument("--top-k", type=int, default=10)
     run.add_argument("--chat", action="store_true", help="Send the prompt through the chat template (instruct models)")
     run.set_defaults(func=_cmd_run)
@@ -127,7 +130,8 @@ def main(argv=None) -> int:
     trace.add_argument("--top", type=int, default=8, help="Detections recorded per token")
     trace.add_argument("--raw", action="store_true", help="Continue the prompt as raw text instead of a chat turn")
     trace.add_argument("--device", default="cuda")
-    trace.add_argument("--max-loaded", type=int, default=1000)
+    trace.add_argument("--max-loaded", type=int, default=None, help="Most lenses kept on the GPU, active plus warm (default 1000, or the pack's)")
+    trace.add_argument("--ram-mb", type=int, default=8192, help="Lens pack held in CPU RAM, MB (0: read from disk)")
     trace.set_defaults(func=_cmd_trace)
 
     srv = sub.add_parser("serve", help="Serve an OpenAI-compatible chat API that streams concept readings, plus a live viewer")
@@ -137,7 +141,8 @@ def main(argv=None) -> int:
     srv.add_argument("--port", type=int, default=8765)
     srv.add_argument("--device", default="cuda")
     srv.add_argument("--watch", type=Path, help="Watch profile: concepts that set safety_intensity / alerts")
-    srv.add_argument("--max-loaded", type=int, default=1000)
+    srv.add_argument("--max-loaded", type=int, default=None, help="Most lenses kept on the GPU, active plus warm (default 1000, or the pack's)")
+    srv.add_argument("--ram-mb", type=int, default=8192, help="Lens pack held in CPU RAM, MB (0: read from disk)")
     srv.set_defaults(func=_cmd_serve)
 
     pack = sub.add_parser("pack", help="Lens pack utilities")
