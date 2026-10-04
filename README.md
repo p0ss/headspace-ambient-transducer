@@ -16,7 +16,8 @@ was engaging with. Nothing to install.
   arranged as an ontology, broad concepts at the top and specific ones
   beneath. Only the top layer is always on. When a concept fires, its
   children are loaded and checked; when it goes quiet, they are put away.
-  A pack of 8,000 concepts runs with a few dozen in memory.
+  Between tokens, a pack of 8,000 concepts keeps a few dozen lenses active,
+  with the whole pack waiting in CPU RAM.
 - **Uses an ontology you choose.** A pack is whatever set of concepts you
   care about: fields of knowledge, risks in your domain, your organisation's
   policies. The demo pack is laid out like a university: Fields of human
@@ -94,9 +95,11 @@ Monitoring time per token on an RTX 3090 (`demo/bench_monitor.py`):
 
 With the university pack, a whole token takes about 31.6 ms against 26.5 ms
 with no monitoring: about 19% more. A pack 45 times broader costs about twice
-as much monitoring, because the hierarchy keeps only a few dozen lenses
-loaded either way. Lens weights stay in CPU RAM (8 GB by default), so loading
-a branch is a copy rather than a read from disk.
+as much monitoring, because only the active branches are scored. The whole
+pack is held in CPU RAM (8 GB by default), so loading a branch is a copy
+rather than a read from disk, and recently used lenses stay on the GPU for
+reuse: about 0.7 GB for the university pack and up to 3.5 GB for First Light
+at its default settings, against 10.7 GB for every First Light lens.
 
 ## How a lens works
 
@@ -119,9 +122,13 @@ confused with, and HatCat trains a lens for each concept on your model.
 
 ## Status
 
-Early. In progress:
+HAT is the monitoring runtime from [HatCat](https://github.com/p0ss/HatCat),
+developed there over the past two years and now packaged on its own so it can
+be dropped into other systems. The university pack is the newest pack; its
+next tier, 2,142 Schools, is in training.
 
-- The next tier of the university pack (2,142 Schools).
+Also in progress:
+
 - Known-answer tests that check a deployed monitor detects, and doesn't
   detect, what its calibration says it should.
 - Lazy per-branch download of large packs.
