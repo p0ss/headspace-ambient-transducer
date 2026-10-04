@@ -87,11 +87,21 @@ def detect_layer_norm(state_dict: dict) -> bool:
     return False
 
 
+def empty_mlp(input_dim: int, device, layer_norm: bool = False) -> SimpleMLP:
+    """A SimpleMLP allocated on `device` with uninitialised weights, to load a state dict into.
+
+    Building one the ordinary way initialises every weight on the CPU and copies
+    it to the device, only for load_state_dict to overwrite it.
+    """
+    with torch.device("meta"):
+        lens = SimpleMLP(input_dim, layer_norm=layer_norm)
+    return lens.to_empty(device=device).eval()
+
+
 def create_lens_from_state_dict(state_dict: dict, hidden_dim: int, device: str) -> SimpleMLP:
     """Create SimpleMLP matching the state_dict architecture."""
     has_ln = detect_layer_norm(state_dict)
-    lens = SimpleMLP(hidden_dim, layer_norm=has_ln).to(device)
-    lens.eval()
+    lens = empty_mlp(hidden_dim, device, layer_norm=has_ln)
 
     # Handle missing net. prefix
     if "0.weight" in state_dict and "net.0.weight" not in state_dict:
@@ -275,4 +285,5 @@ __all__ = [
     "ConceptMetadata",
     "detect_layer_norm",
     "create_lens_from_state_dict",
+    "empty_mlp",
 ]

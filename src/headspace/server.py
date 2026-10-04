@@ -79,7 +79,7 @@ def create_app(monitor: Monitor, pack_dir: Path, model_name: str):
 
     def token_metadata(step) -> dict:
         scores = monitor.lenses.cache.lens_scores
-        alerts = [d for d in step.detections if d.concept in {a.concept for a in step.alerts}]
+        alerts = step.alerts  # every watched concept above threshold, in the top detections or not
         top = step.detections[:10]
         return {
             "divergence": {

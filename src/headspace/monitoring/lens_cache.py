@@ -12,6 +12,7 @@ Manages multi-tier caching for lens management:
 from __future__ import annotations
 
 import time
+from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Set, Tuple, Optional, TYPE_CHECKING
@@ -19,8 +20,8 @@ from typing import Dict, List, Set, Tuple, Optional, TYPE_CHECKING
 import torch
 import torch.nn as nn
 
-from .lens_types import SimpleMLP, ConceptMetadata
-from .lens_batched import BatchedLensBank
+from .lens_types import SimpleMLP, ConceptMetadata, empty_mlp
+from .lens_batched import BatchedLensBank, FusedLensBank
 
 if TYPE_CHECKING:
     pass
@@ -82,6 +83,7 @@ class LensCacheManager:
 
         # Batched inference bank
         self._lens_bank: Optional[BatchedLensBank] = None
+        self._fused_bank: Optional[FusedLensBank] = None
         self._lens_bank_dirty: bool = True
         self._use_batched_inference: bool = True
 
@@ -106,8 +108,7 @@ class LensCacheManager:
 
         print(f"  Preallocating model pool ({self.model_pool_size} models)...")
         for i in range(self.model_pool_size):
-            model = SimpleMLP(self.hidden_dim).to(self.device)
-            model.eval()
+            model = empty_mlp(self.hidden_dim, self.device)
             self.model_pool.append(model)
             self.available_models.append(i)
 
@@ -380,14 +381,26 @@ class LensCacheManager:
         else:
             self._lens_bank.clear()
 
-        # Only single-layer probes batch together; multi-layer Lenses score on their own
-        single_layer = {k: l for k, l in self.loaded_lenses.items() if isinstance(l, SimpleMLP)}
-        if single_layer:
-            # Include polar negative lenses if any are loaded
-            negative_lenses = self.loaded_polar_negative_lenses if self.loaded_polar_negative_lenses else None
-            self._lens_bank.add_lenses(single_layer, negative_lenses=negative_lenses)
+        # Polar lenses score both poles through BatchedLensBank. Otherwise every
+        # lens, single-layer or multi-layer, goes in the fused bank.
+        if self.loaded_polar_negative_lenses:
+            single_layer = {k: l for k, l in self.loaded_lenses.items() if isinstance(l, SimpleMLP)}
+            if single_layer:
+                self._lens_bank.add_lenses(single_layer, negative_lenses=self.loaded_polar_negative_lenses)
+            rest = {k: l for k, l in self.loaded_lenses.items() if k not in single_layer}
+        else:
+            rest = dict(self.loaded_lenses)
+        self._fused_bank, _ = FusedLensBank.build(rest)
 
         self._lens_bank_dirty = False
+
+    def get_fused_bank(self) -> Optional[FusedLensBank]:
+        """The fused bank of loaded lenses, rebuilding if necessary (None when nothing fuses)."""
+        if not self._use_batched_inference:
+            return None
+        if self._lens_bank_dirty:
+            self.rebuild_lens_bank()
+        return self._fused_bank
 
     def get_lens_bank(self) -> Optional[BatchedLensBank]:
         """Get the lens bank, rebuilding if necessary."""
@@ -407,15 +420,21 @@ class LensCacheManager:
         self,
         concept_metadata: Dict[Tuple[str, int], ConceptMetadata],
         max_ram_mb: int = None,
-        priority_layers: List[int] = None
+        priority_layers: List[int] = None,
+        workers: int = 8,
     ) -> Dict[str, any]:
         """
-        Pre-load lens pack to CPU RAM (tepid cache).
+        Pre-load lens pack to CPU RAM (tepid cache), so loading a lens later is a
+        copy to the device instead of a torch.load from disk.
+
+        Single-probe lenses are cached as their state dict; multi-layer lenses as
+        {model_layer: state dict}. Weights stay in the pack's on-disk dtype.
 
         Args:
             concept_metadata: Dict of concept_key -> ConceptMetadata
             max_ram_mb: Max RAM to use (MB). None = no limit.
-            priority_layers: Load these layers first.
+            priority_layers: Load these hierarchy layers first.
+            workers: Threads reading files in parallel.
 
         Returns:
             Dict with loading stats
@@ -425,101 +444,56 @@ class LensCacheManager:
 
         if priority_layers is None:
             priority_layers = [3, 4, 5, 6, 2, 1, 0]
-
         start = time.time()
-        loaded_count = 0
-        loaded_bytes = 0
         max_bytes = max_ram_mb * 1024 * 1024 if max_ram_mb else float('inf')
 
-        # Collect concepts by layer
-        concepts_by_layer: Dict[int, List[Tuple[str, int]]] = defaultdict(list)
-        for concept_key, metadata in concept_metadata.items():
-            # Multi-layer lenses hold several state dicts; they load from disk instead
+        def paths_of(metadata):
             if metadata.probe_paths:
-                continue
+                return dict(metadata.probe_paths)
             if metadata.activation_lens_path and metadata.activation_lens_path.exists():
-                concepts_by_layer[metadata.layer].append(concept_key)
+                return {None: metadata.activation_lens_path}
+            return {}
 
-        # Load in priority order
-        for layer in priority_layers:
-            if layer not in concepts_by_layer:
-                continue
+        order = {layer: i for i, layer in enumerate(priority_layers)}
+        keys = sorted((k for k, m in concept_metadata.items() if k not in self.tepid_cache and paths_of(m)),
+                      key=lambda k: (order.get(k[1], len(order) + k[1]), k))
 
-            for concept_key in concepts_by_layer[layer]:
+        def read(concept_key):
+            entry = {}
+            for model_layer, path in paths_of(concept_metadata[concept_key]).items():
+                state_dict = torch.load(path, map_location='cpu', weights_only=True)
+                if not any(k.startswith('net.') for k in state_dict):
+                    state_dict = {f'net.{k}': v for k, v in state_dict.items()}
+                entry[model_layer] = state_dict
+            return concept_key, entry
+
+        loaded_count, loaded_bytes, failed = 0, 0, 0
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            # In chunks, so the RAM budget stops reading early
+            for i in range(0, len(keys), 256):
                 if loaded_bytes >= max_bytes:
                     break
-
-                if concept_key in self.tepid_cache:
-                    continue
-
-                metadata = concept_metadata[concept_key]
-                try:
-                    state_dict = torch.load(
-                        metadata.activation_lens_path,
-                        map_location='cpu',
-                        weights_only=True
-                    )
-
-                    # Handle key mismatch
-                    if self.model_pool:
-                        model_keys = set(self.model_pool[0].state_dict().keys())
-                        loaded_keys = set(state_dict.keys())
-                        if model_keys != loaded_keys and not any(k.startswith('net.') for k in loaded_keys):
-                            state_dict = {f'net.{k}': v for k, v in state_dict.items()}
-
-                    self.tepid_cache[concept_key] = state_dict
+                futures = [executor.submit(read, k) for k in keys[i:i + 256]]
+                for future in futures:
+                    try:
+                        concept_key, entry = future.result()
+                    except Exception as e:
+                        failed += 1
+                        continue
+                    if loaded_bytes >= max_bytes:
+                        break
+                    self.tepid_cache[concept_key] = entry[None] if None in entry else entry
                     loaded_count += 1
-
-                    for v in state_dict.values():
-                        loaded_bytes += v.numel() * v.element_size()
-
-                except Exception as e:
-                    print(f"  Warning: Failed to preload {concept_key[0]}: {e}")
-
-            if loaded_bytes >= max_bytes:
-                print(f"  RAM budget reached at layer {layer}")
-                break
-
-        # Load remaining layers
-        all_layers = set(concepts_by_layer.keys())
-        remaining_layers = sorted(all_layers - set(priority_layers))
-        for layer in remaining_layers:
-            if loaded_bytes >= max_bytes:
-                break
-            for concept_key in concepts_by_layer[layer]:
-                if loaded_bytes >= max_bytes:
-                    break
-                if concept_key in self.tepid_cache:
-                    continue
-
-                metadata = concept_metadata[concept_key]
-                try:
-                    state_dict = torch.load(
-                        metadata.activation_lens_path,
-                        map_location='cpu',
-                        weights_only=True
-                    )
-                    if self.model_pool:
-                        model_keys = set(self.model_pool[0].state_dict().keys())
-                        loaded_keys = set(state_dict.keys())
-                        if model_keys != loaded_keys and not any(k.startswith('net.') for k in loaded_keys):
-                            state_dict = {f'net.{k}': v for k, v in state_dict.items()}
-
-                    self.tepid_cache[concept_key] = state_dict
-                    loaded_count += 1
-                    for v in state_dict.values():
-                        loaded_bytes += v.numel() * v.element_size()
-                except Exception:
-                    pass
+                    loaded_bytes += sum(v.numel() * v.element_size() for sd in entry.values() for v in sd.values())
 
         self._tepid_cache_loaded = True
-        elapsed = time.time() - start
-
         return {
             "status": "loaded",
             "concepts": loaded_count,
+            "of": len(keys),
+            "failed": failed,
             "ram_mb": loaded_bytes / (1024 * 1024),
-            "elapsed_s": elapsed,
+            "elapsed_s": time.time() - start,
         }
 
     def reset_to_base(self, keep_warm_cache: bool = True):

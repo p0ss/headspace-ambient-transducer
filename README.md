@@ -81,6 +81,10 @@ also watches everything beneath it, so `Deception` covers `AIDeception`,
 profile decides what alerts, not what is monitored. See
 `profiles/ai_risk.txt`.
 
+A watched concept alerts whenever the cascade scores it above the threshold,
+even if other concepts outrank it. Like every concept, it is only scored when
+its parent fires.
+
 ## Lens packs
 
 A lens pack is trained for one specific model. Its layout:

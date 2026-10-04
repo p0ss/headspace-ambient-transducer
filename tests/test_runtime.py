@@ -181,17 +181,24 @@ def test_multi_layer_lens_reads_each_probe_from_its_own_layer(multi_layer_pack):
     assert raw < 0.1
 
 
-def test_multi_layer_lenses_stay_out_of_bank_and_tepid_cache(multi_layer_pack):
+def test_multi_layer_lenses_are_fused_and_ram_cached(multi_layer_pack):
     from headspace.monitoring.lens_types import Lens
-    manager = DynamicLensManager(lenses_dir=multi_layer_pack, device="cpu", base_layers=[0])
-    manager.preload_pack_to_ram()
-    assert ("Deception", 2) not in manager.cache.tepid_cache
+    states = {3: _state(1), 7: _state(-1)}
 
-    states = {3: _state(1), 7: _state(1)}
-    for _ in range(3):
-        manager.detect_and_expand(torch.randn(HIDDEN), layer_states=states)
-    assert isinstance(manager.cache.loaded_lenses[("Deception", 2)], Lens)
-    assert ("Deception", 2) not in manager.cache.get_lens_bank().concept_keys
+    def scores(preload):
+        manager = DynamicLensManager(lenses_dir=multi_layer_pack, device="cpu", base_layers=[0])
+        if preload:
+            manager.preload_pack_to_ram()
+            assert set(manager.cache.tepid_cache[("Deception", 2)]) == set(PROBE_LAYERS)
+        for _ in range(3):
+            manager.detect_and_expand(torch.randn(HIDDEN), layer_states=states)
+        assert isinstance(manager.cache.loaded_lenses[("Deception", 2)], Lens)
+        assert ("Deception", 2) in manager.cache.get_fused_bank().keys
+        return manager.cache.lens_scores[("Deception", 2)], manager.cache.stats["tepid_hits"]
+
+    (from_disk, _), (from_ram, tepid_hits) = scores(False), scores(True)
+    assert tepid_hits > 0
+    assert from_ram == pytest.approx(from_disk)
 
 
 def test_generate_feeds_model_layers_to_lenses(multi_layer_pack):
@@ -226,6 +233,8 @@ def test_generate_feeds_model_layers_to_lenses(multi_layer_pack):
 
     assert len(steps) == 4
     assert all(layers == {3, 5, 7} for layers in seen)
+    assert set(steps[0].layer_states) == {3, 5, 7}
+    assert all(s.peak_lenses >= s.loaded_lenses for s in steps)
     assert any(d.probes for s in steps for d in s.detections if d.concept == "Deception")
 
 

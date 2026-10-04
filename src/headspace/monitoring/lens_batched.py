@@ -439,4 +439,195 @@ class BatchedLensBank(nn.Module):
         return len(self.concept_keys)
 
 
-__all__ = ["BatchedLensBank", "wilson_score_interval"]
+def _probe_parts(mlp: nn.Module):
+    """(layer_norm, [linear1, linear2, linear3]) of a SimpleMLP probe, or None if it isn't one."""
+    from .lens_types import SimpleMLP
+
+    if not isinstance(mlp, SimpleMLP):
+        return None
+    linears = [m for m in mlp.net if isinstance(m, nn.Linear)]
+    if len(linears) != 3:
+        return None
+    return (mlp.net[0] if mlp.has_layer_norm else None), linears
+
+
+class _ProbeGroup:
+    """Probes of one shape, stacked so each Linear is one batched matmul."""
+
+    def __init__(self, probes: List[Tuple[int, int, Optional[nn.LayerNorm], List[nn.Linear]]], input_dim: int):
+        _, _, ln, first = probes[0]
+        device = first[0].weight.device
+        self.positions = torch.tensor([p[0] for p in probes], device=device)  # rows in the bank's probe order
+        self.inputs = torch.tensor([p[1] for p in probes], device=device)     # which input each probe reads
+        self.dtype = first[0].weight.dtype
+        self.input_dim = input_dim
+        self.W = [torch.stack([p[3][k].weight.detach() for p in probes]).transpose(1, 2) for k in range(3)]
+        self.b = [torch.stack([p[3][k].bias.detach() for p in probes]).unsqueeze(1) for k in range(3)]
+        if ln is not None:
+            self.ln_eps = ln.eps
+            self.ln_w = torch.stack([p[2].weight.detach() for p in probes]).unsqueeze(1)
+            self.ln_b = torch.stack([p[2].bias.detach() for p in probes]).unsqueeze(1)
+        else:
+            self.ln_w = None
+
+    def __call__(self, inputs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """inputs [n_inputs, batch, input_dim] -> (probabilities, logits), each [n_probes, batch] float."""
+        x = inputs[self.inputs].to(self.dtype)
+        if self.ln_w is not None:
+            x = torch.nn.functional.layer_norm(x, (self.input_dim,), eps=self.ln_eps) * self.ln_w + self.ln_b
+        h = torch.baddbmm(self.b[0], x, self.W[0]).relu_()
+        h = torch.baddbmm(self.b[1], h, self.W[1]).relu_()
+        logits = torch.baddbmm(self.b[2], h, self.W[2]).squeeze(-1)
+        # Sigmoid in the probe's dtype, then float: as SimpleMLP.forward followed by Lens's .float()
+        return torch.sigmoid(logits).float(), logits.float()
+
+
+class FusedLensBank:
+    """
+    Every lens in a set, single-layer or multi-layer, scored in a few batched ops.
+
+    Scoring lens by lens costs a dozen small kernel launches per probe and a
+    device sync per lens. Here the probes of all lenses are stacked by shape,
+    so each Linear layer of every probe runs as one batched matmul (baddbmm).
+    Calibrated probes become percentiles with one batched searchsorted per
+    quantile count, and each lens then reduces its probes as Lens.forward
+    does: the max of calibrated percentiles, or the mean of raw scores.
+    Single-layer lenses are one-probe lenses reading the default hidden state.
+
+    The scores equal sequential scoring up to floating-point summation order.
+    Lens.last_probe_scores is set for every multi-layer lens scored, as
+    Lens.forward sets it.
+
+    `build` takes what it can fuse and returns the rest to be scored on their own:
+    lenses that aren't SimpleMLP or Lens(SimpleMLP probes).
+    """
+
+    def __init__(self):
+        self.keys: List = []
+        self.lenses: List[nn.Module] = []
+
+    @classmethod
+    def build(cls, lenses: Dict) -> Tuple[Optional["FusedLensBank"], Dict]:
+        from .lens_types import Lens
+
+        bank, leftover = cls(), {}
+        probes = []          # (lens index, input key, probe module, quantiles or None)
+        for key, lens in lenses.items():
+            if isinstance(lens, Lens):
+                parts = [(layer, lens.probes[str(layer)]) for layer in lens.model_layers]
+                calibrated = lens.calibrated
+            else:
+                parts, calibrated = [(None, lens)], False
+            if not all(_probe_parts(mlp) for _, mlp in parts):
+                leftover[key] = lens
+                continue
+            index = len(bank.keys)
+            bank.keys.append(key)
+            bank.lenses.append(lens)
+            for layer, mlp in parts:
+                q = getattr(lens, f"quantiles_{layer}") if calibrated else None
+                probes.append((index, layer, mlp, q))
+        if not bank.keys:
+            return None, leftover
+
+        device = next(bank.lenses[0].parameters()).device
+        # Inputs: None is the default hidden state (single-layer lenses), ints are model layers
+        bank.input_keys = sorted({p[1] for p in probes}, key=lambda k: -1 if k is None else k)
+        input_index = {k: i for i, k in enumerate(bank.input_keys)}
+
+        groups: Dict[tuple, list] = {}
+        for position, (_, layer, mlp, _) in enumerate(probes):
+            ln, linears = _probe_parts(mlp)
+            signature = (tuple(tuple(l.weight.shape) for l in linears), ln is not None,
+                         ln.eps if ln is not None else None, linears[0].weight.dtype)
+            groups.setdefault(signature, []).append((position, input_index[layer], ln, linears))
+        bank.groups = [_ProbeGroup(members, sig[0][0][1]) for sig, members in groups.items()]
+
+        # Calibration: probes grouped by quantile count, one searchsorted each
+        by_count: Dict[int, list] = {}
+        for position, (_, _, _, q) in enumerate(probes):
+            if q is not None:
+                by_count.setdefault(q.numel(), []).append((position, q))
+        bank.calibration = [
+            (torch.tensor([p for p, _ in members], device=device),
+             torch.stack([q.float().to(device) for _, q in members]))
+            for members in by_count.values()
+        ]
+
+        n = len(bank.keys)
+        bank.n_probes = len(probes)
+        bank.lens_index = torch.tensor([p[0] for p in probes], device=device)
+        bank.is_multi_layer = torch.tensor([isinstance(l, Lens) for l in bank.lenses], device=device)
+        bank.calibrated = torch.tensor([isinstance(l, Lens) and l.calibrated for l in bank.lenses], device=device)
+        # Each multi-layer lens's (model layer, probe position), for last_probe_scores
+        bank.probe_layers = [[] for _ in range(n)]
+        for position, (index, layer, _, _) in enumerate(probes):
+            if layer is not None:
+                bank.probe_layers[index].append((layer, position))
+        bank.device = device
+        return bank, leftover
+
+    def __len__(self):
+        return len(self.keys)
+
+    @staticmethod
+    def _percentile(prob: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
+        """Lens._percentile for many probes: prob [n, batch], q [n, k]."""
+        k = q.shape[1]
+        idx = torch.searchsorted(q, prob.contiguous()).clamp(1, k - 1)
+        lo, hi = q.gather(1, idx - 1), q.gather(1, idx)
+        frac = torch.where(hi > lo, (prob - lo) / (hi - lo), torch.zeros_like(lo)).clamp(0, 1)
+        pct = (idx - 1 + frac) / (k - 1)
+        return torch.where(prob <= q[:, :1], torch.zeros_like(pct),
+                           torch.where(prob >= q[:, -1:], torch.ones_like(pct), pct))
+
+    def score_tensors(self, hidden_state: Optional[torch.Tensor],
+                      layer_states: Optional[Dict[int, torch.Tensor]]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """(lens scores [n_lenses, batch], lens logits [n_lenses, batch], probe scores [n_probes, batch])."""
+        def source(key):
+            if key is None:
+                return hidden_state
+            if layer_states is None or key not in layer_states:
+                raise KeyError(f"multi-layer lenses read model layer {key}; pass it in layer_states")
+            return layer_states[key]
+
+        states = [source(k) for k in self.input_keys]
+        states = [s.unsqueeze(0) if s.dim() == 1 else s for s in states]
+        inputs = torch.stack([s.to(self.device) for s in states])           # [n_inputs, batch, dim]
+        batch = inputs.shape[1]
+
+        prob = torch.empty(self.n_probes, batch, device=self.device)
+        logit = torch.empty(self.n_probes, batch, device=self.device)
+        for group in self.groups:
+            p, l = group(inputs)
+            prob[group.positions] = p
+            logit[group.positions] = l
+
+        value = prob.clone()  # calibrated probes as percentiles, the rest raw
+        for positions, q in self.calibration:
+            value[positions] = self._percentile(prob[positions], q)
+
+        index = self.lens_index[:, None].expand(-1, batch)
+        zeros = torch.zeros(len(self.keys), batch, device=self.device)
+        mean = zeros.scatter_reduce(0, index, value, "mean", include_self=False)
+        peak = zeros.scatter_reduce(0, index, value, "amax", include_self=False)
+        scores = torch.where(self.calibrated[:, None], peak, mean)
+        # Lens logits are the logit of the combined score; single-layer lenses keep their own
+        raw_logit = zeros.scatter_reduce(0, index, logit, "amax", include_self=False)
+        logits = torch.where(self.is_multi_layer[:, None], torch.logit(scores.clamp(1e-6, 1 - 1e-6)), raw_logit)
+        return scores, logits, value
+
+    def score(self, hidden_state: Optional[torch.Tensor], layer_states: Optional[Dict[int, torch.Tensor]] = None,
+              ) -> Tuple[Dict, Dict]:
+        """({key: score}, {key: logit}) for the first row of the batch, with one device sync."""
+        scores, logits, value = self.score_tensors(hidden_state, layer_states)
+        n = len(self.keys)
+        flat = torch.cat([scores[:, 0], logits[:, 0], value[:, 0]]).tolist()
+        score_list, logit_list, probe_list = flat[:n], flat[n:2 * n], flat[2 * n:]
+        for lens, layers in zip(self.lenses, self.probe_layers):
+            if layers:
+                lens.last_probe_scores = {layer: probe_list[position] for layer, position in layers}
+        return dict(zip(self.keys, score_list)), dict(zip(self.keys, logit_list))
+
+
+__all__ = ["BatchedLensBank", "FusedLensBank", "wilson_score_interval"]

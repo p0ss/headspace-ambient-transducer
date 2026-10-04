@@ -44,7 +44,7 @@ from .lens_types import (
     detect_layer_norm,
     create_lens_from_state_dict,
 )
-from .lens_batched import BatchedLensBank
+from .lens_batched import BatchedLensBank, FusedLensBank
 from .lens_hierarchy import HierarchyManager
 from .lens_cache import LensCacheManager
 from .lens_loader import LensLoader, MetadataLoader
@@ -246,6 +246,9 @@ class DynamicLensManager:
         # Manifest
         self.manifest: Optional["DeploymentManifest"] = None
         self.manifest_resolver: Optional["ManifestResolver"] = None
+        # From the last detect_and_expand: every lens scored, and the most resident before pruning
+        self.last_scores: Dict[Tuple[str, int], Tuple[float, int]] = {}
+        self.last_peak_loaded = 0
 
         if manifest_path is not None:
             from .deployment_manifest import DeploymentManifest
@@ -611,6 +614,16 @@ class DynamicLensManager:
             hidden_state = self._layer_norm(hidden_state)
         return hidden_state.to(self.device)
 
+    def _record_scores(self, scored, current_scores, current_logits):
+        """Record a bank's ({key: score}, {key: logit}) as _score_lens results would be."""
+        scores, logits = scored
+        for concept_key, prob in scores.items():
+            current_scores[concept_key] = prob
+            self.cache.lens_scores[concept_key] = prob
+            self.cache.lens_access_count[concept_key] += 1
+            if current_logits is not None:
+                current_logits[concept_key] = logits[concept_key]
+
     @staticmethod
     def _score_lens(lens, hidden_state, layer_states, return_logits):
         """Run one lens on its input: the default hidden state, or its model layers."""
@@ -688,8 +701,11 @@ class DynamicLensManager:
                     self.cache.lens_scores[concept_key] = current_scores[concept_key]
                     self.cache.lens_access_count[concept_key] += 1
 
-            # Lenses the bank didn't score: multi-layer Lenses, or all of them
-            # when there is no compiled bank
+            fused = self.cache.get_fused_bank()
+            if fused is not None:
+                self._record_scores(fused.score(hidden_state, layer_states), current_scores, current_logits)
+
+            # Lenses no bank scored (or all of them with batching off)
             for concept_key, lens in self.cache.loaded_lenses.items():
                 if concept_key in current_scores:
                     continue
@@ -765,11 +781,19 @@ class DynamicLensManager:
                         timing['_disk_load'] = timing.get('_disk_load', 0) + (time.time() - t_load_start) * 1000
                     total_children_loaded += len(child_keys_to_load)
 
-                    # Score newly loaded lenses
+                    # Score newly loaded lenses: together, unless batching is off or they're polar
                     t_score_start = time.time()
                     with torch.inference_mode():
+                        children = {k: self.cache.loaded_lenses[k] for k in child_keys_to_load
+                                    if k in self.cache.loaded_lenses}
+                        if self.cache._use_batched_inference:
+                            children = {k: l for k, l in children.items() if not self.cache.is_polar_concept(k)}
+                            fused, _ = FusedLensBank.build(children)
+                            if fused is not None:
+                                self._record_scores(fused.score(hidden_state, layer_states),
+                                                    current_scores, current_logits)
                         for concept_key in child_keys_to_load:
-                            if concept_key in self.cache.loaded_lenses:
+                            if concept_key in self.cache.loaded_lenses and concept_key not in current_scores:
                                 lens = self.cache.loaded_lenses[concept_key]
                                 prob, logit = self._score_lens(lens, hidden_state, layer_states, return_logits)
                                 if return_logits:
@@ -791,6 +815,7 @@ class DynamicLensManager:
         cache_hits_this_token = getattr(self.cache, '_last_warm_cache_hits', 0)
         cache_misses_this_token = total_children_loaded
 
+        self.last_peak_loaded = len(self.cache.loaded_lenses)
         if not skip_pruning:
             # Get top-k from ALL current scores (including parents)
             # NOTE: Parents are NOT excluded from top-k calculation - they stay loaded
@@ -810,11 +835,11 @@ class DynamicLensManager:
         if use_calibration and self.manifest is not None:
             calibration_data = self.manifest.concept_calibration
 
-        for concept_key, prob in current_scores.items():
-            # Only skip parents that were decomposed into children during this detection
-            if concept_key in decomposed_parents:
-                continue
+        # Every lens scored this token, decomposed parents included, for alerting
+        # on concepts outside the top-k: (concept, layer) -> (display score, level)
+        self.last_scores = {}
 
+        for concept_key, prob in current_scores.items():
             concept_name, model_layer = concept_key
 
             # Get ontological level from metadata (defaults to model_layer for backward compat)
@@ -841,6 +866,11 @@ class DynamicLensManager:
                     cross_fire_rate=1.0, gen_fire_rate=1.0  # confidence=0
                 )
                 display_prob = default_cal.normalize(prob)
+
+            self.last_scores[concept_key] = (display_prob, ontological_level)
+            # Only skip parents that were decomposed into children during this detection
+            if concept_key in decomposed_parents:
+                continue
 
             # Report ontological level (not model layer) in results
             if return_logits:

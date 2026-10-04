@@ -37,10 +37,14 @@ class Step:
     token: str
     detections: List[Detection]
     alerts: List[Detection]
-    loaded_lenses: int
+    loaded_lenses: int  # resident after this token's pruning
     total_lenses: int
     lens_memory_mb: float
     monitor_ms: float
+    peak_lenses: int = 0  # most resident during this token, before pruning
+    # The hidden states the lenses read (model layer -> [1, hidden]), as views
+    # into this forward pass's outputs: holding a Step keeps them alive.
+    layer_states: Optional[Dict[int, torch.Tensor]] = None
 
 
 @dataclass
@@ -58,8 +62,12 @@ class WatchProfile:
     def matches(self, detection: Detection) -> bool:
         if detection.score < (self.threshold if self.threshold is not None else 0.5):
             return False
+        return self.covers(detection.path)
+
+    def covers(self, path: Sequence[str]) -> bool:
+        """Whether a concept with this hierarchy path is watched, whatever its score."""
         watched = set(self.concepts)
-        return any(name in watched for name in detection.path)
+        return any(name in watched for name in path)
 
     @classmethod
     def from_file(cls, path: Path, threshold: Optional[float] = None) -> "WatchProfile":
@@ -84,6 +92,12 @@ class Monitor:
         hidden_layer: model layer single-probe lenses read. Defaults to the
             pack's declared `model_layer`, else the last layer. Multi-layer
             lenses always read the model layers their probes were trained on.
+
+        Alerts come from every lens scored on a token, not only the top_k
+        detections: a watched concept above threshold alerts even when other
+        concepts outrank it. A watched concept is only scored when the cascade
+        reaches it, as for any other concept: if its parent doesn't fire, it
+        isn't active.
         """
         self.model = model
         self.tokenizer = tokenizer
@@ -95,6 +109,7 @@ class Monitor:
             hidden_layer = lens_manager.model_layer
         self.hidden_layer = hidden_layer
         self.top_k = top_k
+        self.alerts: List[Detection] = []  # from the last read
 
     @classmethod
     def from_pretrained(
@@ -106,8 +121,15 @@ class Monitor:
         dtype: torch.dtype = torch.bfloat16,
         watch: Optional[WatchProfile] = None,
         max_loaded_lenses: int = 1000,
+        ram_mb: Optional[int] = 8192,
         **manager_kwargs,
     ) -> "Monitor":
+        """Load a model and attach a lens pack to it.
+
+        ram_mb: preload up to this much of the pack into CPU RAM (in its on-disk
+            dtype), so lenses the cascade loads are copied to the device instead
+            of read from disk. 0 turns it off; None preloads the whole pack.
+        """
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
         pack_dir = Path(pack_dir)
@@ -137,6 +159,8 @@ class Monitor:
         manager = DynamicLensManager(**kwargs)
         if not manager.concept_metadata:
             raise RuntimeError(f"No concepts with lenses found in {pack_dir}")
+        if ram_mb != 0:
+            manager.preload_pack_to_ram(max_ram_mb=ram_mb)
 
         return cls(model, tokenizer, manager, watch=watch)
 
@@ -178,17 +202,35 @@ class Monitor:
             default = hidden_state.float()
 
         results, _ = self.lenses.detect_and_expand(default, top_k=self.top_k, layer_states=layer_states)
-        detections = [
-            Detection(
-                concept=name,
-                score=float(score),
-                layer=int(layer),
-                path=self.lenses.get_concept_path(name, layer),
-                probes=self.lenses.get_probe_scores(name, layer),
-            )
-            for name, score, layer in results
-        ]
+        detections = [self._detection(name, score, layer) for name, score, layer in results]
+        self.alerts = self._alerts(detections)
         return detections, (time.perf_counter() - start) * 1000
+
+    def _detection(self, name: str, score: float, layer: int) -> Detection:
+        return Detection(
+            concept=name,
+            score=float(score),
+            layer=int(layer),
+            path=self.lenses.get_concept_path(name, layer),
+            probes=self.lenses.get_probe_scores(name, layer),
+        )
+
+    def _alerts(self, detections: List[Detection]) -> List[Detection]:
+        """Watched concepts above threshold among every lens scored, top-k or not, highest first."""
+        if not self.watch.concepts:
+            return []
+        threshold = self.watch.threshold if self.watch.threshold is not None else 0.5
+        shown = {(d.concept, d.layer): d for d in detections}
+        alerts = []
+        for (name, _), (score, level) in getattr(self.lenses, "last_scores", {}).items():
+            if score < threshold:
+                continue
+            detection = shown.get((name, int(level))) or self._detection(name, score, level)
+            if self.watch.covers(detection.path):
+                alerts.append(detection)
+        if not hasattr(self.lenses, "last_scores"):  # a lens manager without it: top-k only
+            alerts = [d for d in detections if self.watch.matches(d)]
+        return sorted(alerts, key=lambda d: d.score, reverse=True)
 
     def _stop_ids(self) -> set:
         """End-of-sequence ids: the tokenizer's, plus the model's generation config (e.g. end-of-turn)."""
@@ -261,11 +303,13 @@ class Monitor:
                 token_id=int(token_id),
                 token=self.tokenizer.decode(token_id[0]),
                 detections=detections,
-                alerts=[d for d in detections if self.watch.matches(d)],
+                alerts=self.alerts,
                 loaded_lenses=len(self.lenses.cache.loaded_lenses),
                 total_lenses=self.total_lenses,
                 lens_memory_mb=self.lens_memory_mb(),
                 monitor_ms=ms,
+                peak_lenses=getattr(self.lenses, "last_peak_loaded", 0),
+                layer_states=layer_states,
             )
 
             if int(token_id) in self._stop_ids():

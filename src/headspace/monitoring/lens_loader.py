@@ -25,6 +25,7 @@ from .lens_types import (
     ConceptMetadata,
     detect_layer_norm,
     create_lens_from_state_dict,
+    empty_mlp,
     parse_probe_filename,
 )
 
@@ -123,6 +124,13 @@ class LensLoader:
 
                 # Check tepid cache
                 state_dict = cache_manager.check_tepid_cache(concept_key)
+                metadata = concept_metadata.get(concept_key)
+                if state_dict is not None and metadata is not None and metadata.probe_paths:
+                    # Multi-layer lens: {model_layer: state dict}
+                    probes = {model_layer: create_lens_from_state_dict(sd, cache_manager.hidden_dim, self.device)
+                              for model_layer, sd in state_dict.items()}
+                    self._add_multi_layer_lens(concept_key, probes, cache_manager)
+                    continue
                 if state_dict is not None:
                     # Transfer to GPU and create lens
                     state_dict_gpu = {k: v.to(self.device) for k, v in state_dict.items()}
@@ -132,7 +140,7 @@ class LensLoader:
                     else:
                         lens = cache_manager.get_model_from_pool()
                         if lens is None:
-                            lens = SimpleMLP(cache_manager.hidden_dim).to(self.device)
+                            lens = empty_mlp(cache_manager.hidden_dim, self.device)
                             lens.eval()
                         lens.load_state_dict(state_dict_gpu)
 
@@ -267,7 +275,7 @@ class LensLoader:
             else:
                 lens = cache_manager.get_model_from_pool()
                 if lens is None:
-                    lens = SimpleMLP(cache_manager.hidden_dim).to(self.device)
+                    lens = empty_mlp(cache_manager.hidden_dim, self.device)
                     lens.eval()
                 lens.load_state_dict(state_dict)
 
@@ -294,17 +302,20 @@ class LensLoader:
             results = list(executor.map(load_probes, keys_to_load))
 
         for concept_key, probes in results:
-            term, layer = concept_key
-            calibration = {
-                model_layer: self.probe_calibration[f"layer{layer}/{term}@L{model_layer}"]
-                for model_layer in probes
-                if f"layer{layer}/{term}@L{model_layer}" in self.probe_calibration
-            }
-            lens = Lens(probes, calibration=calibration).eval()
-            cache_manager.add_to_active(concept_key, lens)
+            self._add_multi_layer_lens(concept_key, probes, cache_manager)
             cache_manager.stats['cache_misses'] += 1
 
         return len(results)
+
+    def _add_multi_layer_lens(self, concept_key, probes, cache_manager: "LensCacheManager"):
+        """Wrap per-layer probes as a Lens, with the pack's per-probe calibration, and activate it."""
+        term, layer = concept_key
+        calibration = {
+            model_layer: self.probe_calibration[f"layer{layer}/{term}@L{model_layer}"]
+            for model_layer in probes
+            if f"layer{layer}/{term}@L{model_layer}" in self.probe_calibration
+        }
+        cache_manager.add_to_active(concept_key, Lens(probes, calibration=calibration).eval())
 
     def _load_polar_lenses(
         self,
@@ -345,7 +356,7 @@ class LensLoader:
             if has_ln:
                 pos_lens = create_lens_from_state_dict(pos_state, cache_manager.hidden_dim, self.device)
             else:
-                pos_lens = SimpleMLP(cache_manager.hidden_dim).to(self.device)
+                pos_lens = empty_mlp(cache_manager.hidden_dim, self.device)
                 pos_lens.eval()
                 pos_lens.load_state_dict(pos_state)
 
@@ -354,7 +365,7 @@ class LensLoader:
             if has_ln_neg:
                 neg_lens = create_lens_from_state_dict(neg_state, cache_manager.hidden_dim, self.device)
             else:
-                neg_lens = SimpleMLP(cache_manager.hidden_dim).to(self.device)
+                neg_lens = empty_mlp(cache_manager.hidden_dim, self.device)
                 neg_lens.eval()
                 neg_lens.load_state_dict(neg_state)
 
