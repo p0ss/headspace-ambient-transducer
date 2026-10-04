@@ -167,8 +167,10 @@ def serve(model: str, pack: Path, host: str = "127.0.0.1", port: int = 8765, dev
           watch: Optional[Path] = None, max_loaded: int = 1000):
     import uvicorn
 
+    from .pack import resolve_pack
     from .runtime import WatchProfile
 
+    pack = resolve_pack(pack)
     monitor = Monitor.from_pretrained(model, pack, device=device, max_loaded_lenses=max_loaded,
                                       watch=WatchProfile.from_file(watch) if watch else None)
     monitor.top_k = 10

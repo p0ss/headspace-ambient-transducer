@@ -67,11 +67,12 @@ def _cmd_trace(args) -> int:
     import json
 
     from .runtime import Monitor
+    from .pack import resolve_pack
     from .trace import load_prompts, record
 
     monitor = Monitor.from_pretrained(args.model, args.pack, device=args.device, max_loaded_lenses=args.max_loaded)
     monitor.top_k = max(args.top, 10)
-    trace = record(monitor, args.pack, load_prompts(args.prompts), max_new_tokens=args.max_new_tokens,
+    trace = record(monitor, resolve_pack(args.pack), load_prompts(args.prompts), max_new_tokens=args.max_new_tokens,
                    top=args.top, chat=not args.raw, model_name=args.model)
     Path(args.output).write_text(json.dumps(trace, separators=(",", ":")))
     print(f"Wrote {sum(len(r['tokens']) for r in trace['runs'])} tokens across {len(trace['runs'])} prompts to {args.output}")
@@ -104,7 +105,7 @@ def main(argv=None) -> int:
     run = sub.add_parser("run", help="Generate from a prompt and monitor concepts per token")
     run.add_argument("prompt")
     run.add_argument("--model", required=True)
-    run.add_argument("--pack", required=True, type=Path)
+    run.add_argument("--pack", required=True, type=Path, help="Lens pack directory, or Hugging Face repo id (org/name)")
     run.add_argument("--hierarchy", type=Path, help="Concept hierarchy dir, if the pack has none")
     run.add_argument("--watch", type=Path, help="File of concept names to alert on, one per line")
     run.add_argument("--threshold", type=float, default=None,

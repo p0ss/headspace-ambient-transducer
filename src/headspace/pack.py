@@ -21,6 +21,21 @@ import shutil
 from pathlib import Path
 from typing import Dict
 
+def resolve_pack(pack) -> Path:
+    """A local pack directory, or a Hugging Face repo id ("org/name") downloaded to the local cache.
+
+    A local path wins: a directory that exists is used as it is.
+    """
+    path = Path(pack)
+    if path.exists():
+        return path
+    parts = str(pack).split("/")
+    if len(parts) == 2 and all(parts):
+        from huggingface_hub import snapshot_download
+        return Path(snapshot_download(repo_id=str(pack)))
+    raise FileNotFoundError(f"No lens pack at {pack}: pass a pack directory or a Hugging Face repo id (org/name)")
+
+
 # Fields the runtime reads from each concept record, plus definitions for display.
 CONCEPT_FIELDS = (
     "sumo_term",

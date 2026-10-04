@@ -115,7 +115,7 @@ class Monitor:
     def from_pretrained(
         cls,
         model_id: str,
-        pack_dir: Path,
+        pack_dir: Union[Path, str],
         hierarchy_dir: Optional[Path] = None,
         device: str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
@@ -126,13 +126,17 @@ class Monitor:
     ) -> "Monitor":
         """Load a model and attach a lens pack to it.
 
+        pack_dir: a lens pack directory, or a Hugging Face repo id such as
+            "HatCatFTW/gemma-4-e4b-it_university-v3.1-bands" (downloaded once, then cached).
         ram_mb: preload up to this much of the pack into CPU RAM (in its on-disk
             dtype), so lenses the cascade loads are copied to the device instead
             of read from disk. 0 turns it off; None preloads the whole pack.
         """
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
-        pack_dir = Path(pack_dir)
+        from .pack import resolve_pack
+
+        pack_dir = resolve_pack(pack_dir)
         if hierarchy_dir is None and not (pack_dir / "hierarchy").is_dir():
             raise FileNotFoundError(
                 f"{pack_dir} has no hierarchy/ directory. Pass hierarchy_dir, or "
