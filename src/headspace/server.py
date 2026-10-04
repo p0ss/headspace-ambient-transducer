@@ -57,13 +57,15 @@ class ChatRequest(BaseModel):
     temperature: Optional[float] = 0.0
 
 
-def create_app(monitor: Monitor, pack_dir: Path, model_name: str):
+def create_app(monitor: Monitor, pack_dir: Path, model_name: str, pack_name: Optional[str] = None):
     from fastapi import FastAPI, HTTPException
     from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
     concepts = _pack_concepts(Path(pack_dir))
     fields = sorted(t for t, c in concepts.items() if c["level"] == 0)
-    model_id = f"hat/{Path(pack_dir).name}"
+    # A Hub pack resolves to a cache snapshot; name it by its repo instead
+    pack_name = pack_name or Path(pack_dir).name
+    model_id = f"hat/{pack_name}"
     lock = threading.Lock()  # one generation at a time on one GPU
     app = FastAPI(title="Headspace Ambient Transducer")
 
@@ -124,7 +126,7 @@ def create_app(monitor: Monitor, pack_dir: Path, model_name: str):
 
     @app.get("/v1/pack")
     def pack():
-        return {"model": model_name, "pack": Path(pack_dir).name, "total_lenses": monitor.total_lenses,
+        return {"model": model_name, "pack": pack_name, "total_lenses": monitor.total_lenses,
                 "calibrated": bool(getattr(monitor.lenses, "probe_calibrated", False)),
                 "alert_threshold": monitor.watch.threshold, "fields": fields, "concepts": concepts}
 
@@ -170,8 +172,9 @@ def serve(model: str, pack: Path, host: str = "127.0.0.1", port: int = 8765, dev
     from .pack import resolve_pack
     from .runtime import WatchProfile
 
+    pack_name = Path(str(pack)).name
     pack = resolve_pack(pack)
     monitor = Monitor.from_pretrained(model, pack, device=device, max_loaded_lenses=max_loaded, ram_mb=ram_mb,
                                       watch=WatchProfile.from_file(watch) if watch else None)
     monitor.top_k = 10
-    uvicorn.run(create_app(monitor, pack, model), host=host, port=port)
+    uvicorn.run(create_app(monitor, pack, model, pack_name), host=host, port=port)
